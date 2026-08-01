@@ -1,0 +1,5 @@
+.wayfinder/
+research-snapshot/
+.recon/
+node_modules/
+dist/
