@@ -343,6 +343,17 @@ const MODEL_FAMILIES: readonly ModelFamily[] = [
       { dtype: 'fp32', mb: 371, cachedBytesThreshold: 40e6, timeoutMs: 360_000 },
     ],
   },
+  {
+    id: 'onnx-community/depth-anything-v2-large-ONNX',
+    base: 'V2 Large · ONNX',
+    recommended: false,
+    dtypes: [
+      // q4f16：4bit 权重 + fp16 激活，WebGPU 甜点档；q4：fp32 激活，wasm/兼容档；fp16：保真档
+      { dtype: 'q4f16', mb: 230, cachedBytesThreshold: 100e6, timeoutMs: 480_000 },
+      { dtype: 'q4', mb: 307, cachedBytesThreshold: 130e6, timeoutMs: 600_000 },
+      { dtype: 'fp16', mb: 640, cachedBytesThreshold: 280e6, timeoutMs: 900_000 },
+    ],
+  },
 ];
 
 const MODEL_OPTIONS: ModelOption[] = MODEL_FAMILIES.flatMap((m) =>
@@ -580,7 +591,9 @@ async function refreshModelCacheUI(): Promise<void> {
 
 /** base 档位为 CC-BY-NC-4.0（非商用），选中时显示警示（#7 硬性要求） */
 function syncNcWarning(): void {
-  baseNcWarning.hidden = !modelSelect.value.includes('-base');
+  // CC-BY-NC 模型档（V2 Base / V2 Large）旁显示非商用警示（票 #22 由 base 扩展为 base+large）
+  baseNcWarning.hidden =
+    !modelSelect.value.includes('-base') && !modelSelect.value.includes('-large');
 }
 
 // ---------------------------------------------------------------------------

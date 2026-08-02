@@ -207,9 +207,12 @@ const template = `
                     <option value="onnx-community/depth-anything-v2-small-ONNX::fp32">V2 Small · ONNX · f32（~94MB）</option>
                     <option value="onnx-community/depth-anything-v2-base-ONNX::fp16">V2 Base · ONNX · f16（~187MB）</option>
                     <option value="onnx-community/depth-anything-v2-base-ONNX::fp32">V2 Base · ONNX · f32（~371MB）</option>
+                    <option value="onnx-community/depth-anything-v2-large-ONNX::q4f16">V2 Large · ONNX · q4f16（~230MB）</option>
+                    <option value="onnx-community/depth-anything-v2-large-ONNX::q4">V2 Large · ONNX · q4（~307MB）</option>
+                    <option value="onnx-community/depth-anything-v2-large-ONNX::fp16">V2 Large · ONNX · f16（~640MB）</option>
                   </select>
                   <p id="baseNcWarning" class="nc-warning" role="note" data-i18n="nc.warning" hidden>
-                    ⚠ V2 Base 模型许可证为 CC-BY-NC-4.0，仅供学习研究，禁止商用。
+                    ⚠ 当前模型许可证为 CC-BY-NC-4.0，仅供学习研究，禁止商用。
                   </p>
                 </label>
                 <label>

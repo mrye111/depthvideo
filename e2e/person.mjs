@@ -6,8 +6,9 @@
  * 用例C 合成逻辑直测（dev 钩子 __dv.compositePersonMask + 合成掩码）：
  *        人物区保留 / 背景涂黑 / 背景保留原图 / alpha=128→背景、129→保留 阈值。
  * 用例D 强制分割加载失败（route 掐断 tflite）→ 回退全白掩码（=全图），处理完成且画布几乎无纯黑。
- * 用例E base 选项 NC 警示可见性 + 范围联动启用分割/背景下拉。
+ * 用例E base 选项 NC 警示可见性 + 范围联动启用分割/背景下拉 + large 警示显隐（票 #22）。
  * 用例F base fp16 档位开始下载（断言首次下载文案出现即通过，不等 ~187MB 下完，取舍见回报）。
+ * 用例G large q4f16 档位开始下载（断言首次下载文案出现即通过，不等 ~230MB 下完，取舍同 F）。
  * 运行前先起 dev server（E2E_URL，默认 http://localhost:5199），模型缓存复用 .recon/e2e/profile。
  * 用法：node e2e/person.mjs   （E2E_DEVICE=wasm 可强制后端）
  */
@@ -259,10 +260,13 @@ try {
   if (blackD > 0.01) throw new Error(`回退全图失败：纯黑占比 ${blackD}（应为全图深度）`);
   await pd.close();
 
-  // ---- 用例E：base 选项 NC 警示 + 范围联动禁用 ----
+  // ---- 用例E：base 选项 NC 警示 + 范围联动禁用 + large 警示（票 #22） ----
   const pe = await context.newPage();
   await pe.goto(baseURL, { waitUntil: 'domcontentloaded' });
   await pe.waitForSelector('#startButton', { timeout: 15_000 });
+  const defaultModel = await pe.evaluate(() => document.getElementById('modelSelect').value);
+  if (defaultModel !== 'onnx-community/depth-anything-v2-small-ONNX::fp16')
+    throw new Error(`默认档应为 small fp16：${defaultModel}`);
   const warn0 = await pe.evaluate(() => document.getElementById('baseNcWarning').hidden);
   if (!warn0) throw new Error('默认（small）时 NC 警示应隐藏');
   await pe.selectOption('#modelSelect', 'onnx-community/depth-anything-v2-base-ONNX::fp16');
@@ -274,6 +278,17 @@ try {
   if (warn1.hidden) throw new Error('选 base 后 NC 警示未显示');
   if (!warn1.text.includes('CC-BY-NC') || !warn1.text.includes('禁止商用'))
     throw new Error(`NC 警示文案不符：${warn1.text}`);
+  // 票 #22：large 档同样显示警示，且文案已通用化（不点名 V2 Base）
+  await pe.selectOption('#modelSelect', 'onnx-community/depth-anything-v2-large-ONNX::q4f16');
+  const warnL = await pe.evaluate(() => ({
+    hidden: document.getElementById('baseNcWarning').hidden,
+    text: document.getElementById('baseNcWarning').textContent.trim(),
+  }));
+  console.log('[nc] large 警示:', JSON.stringify(warnL));
+  if (warnL.hidden) throw new Error('选 large 后 NC 警示未显示');
+  if (!warnL.text.includes('CC-BY-NC') || !warnL.text.includes('禁止商用'))
+    throw new Error(`NC 警示文案不符：${warnL.text}`);
+  if (warnL.text.includes('V2 Base')) throw new Error(`NC 警示文案未通用化：${warnL.text}`);
   await pe.selectOption('#modelSelect', 'onnx-community/depth-anything-v2-small-ONNX::fp16');
   const warn2 = await pe.evaluate(() => document.getElementById('baseNcWarning').hidden);
   if (!warn2) throw new Error('切回 small 后 NC 警示应隐藏');
@@ -282,7 +297,7 @@ try {
     bg: document.getElementById('personBgSelect').disabled,
   }));
   if (!disabled0.seg || !disabled0.bg) throw new Error('全图模式下分割/背景下拉应禁用');
-  console.log('[nc] 断言通过：警示随 base 档位显隐，全图时分割控件禁用');
+  console.log('[nc] 断言通过：默认 small、警示随 base/large 显隐且文案通用，全图时分割控件禁用');
 
   // ---- 用例F：base fp16 开始下载（不等 ~187MB 下完） ----
   await pe.setInputFiles('#fileInput', sample);
@@ -320,8 +335,49 @@ try {
     throw new Error(`base 档位加载直接失败：${baseStatus}`);
   await pe.screenshot({ path: path.join(outDir, 'person-base-download.png') });
   console.log('[base] 断言通过：base fp16 档位进入下载/初始化流程（未等全量下载，取舍见回报）');
+  await pe.close();
 
-  console.log('\nPASS: 仅人物分割（真实链路/合成逻辑/失败回退）+ NC 警示 + base 档位 全部通过');
+  // ---- 用例G：large q4f16 开始下载（不等 ~230MB 下完，取舍同 base；票 #22） ----
+  const pg = await context.newPage();
+  await pg.goto(baseURL, { waitUntil: 'domcontentloaded' });
+  await pg.waitForSelector('#startButton', { timeout: 15_000 });
+  await pg.setInputFiles('#fileInput', sample);
+  await pg.waitForFunction(
+    () => (document.getElementById('sourceMeta').textContent || '').includes('640×360'),
+    null,
+    { timeout: 20_000 },
+  );
+  await pg.selectOption('#sizeSelect', '384');
+  await pg.selectOption('#fpsSelect', '8');
+  await pg.selectOption('#deviceSelect', device);
+  await pg.selectOption('#modelSelect', 'onnx-community/depth-anything-v2-large-ONNX::q4f16');
+  await pg.click('#startButton');
+  await pg.waitForFunction(
+    () => {
+      const s = document.getElementById('statusLine').textContent || '';
+      const t = document.getElementById('progressTitle').textContent || '';
+      return (
+        (s.includes('V2 Large · ONNX') && s.includes('~230MB')) ||
+        s.includes('正在下载模型') ||
+        t.includes('下载模型') ||
+        s.includes('模型已缓存') ||
+        s.includes('出错') ||
+        s.includes('处理失败')
+      );
+    },
+    null,
+    { timeout: 180_000, polling: 500 },
+  );
+  const largeStatus = ((await pg.textContent('#statusLine')) || '').trim();
+  const largeTitle = ((await pg.textContent('#progressTitle')) || '').trim();
+  console.log(`[large] title=${largeTitle} status=${largeStatus.slice(0, 140)}`);
+  if (largeStatus.includes('处理失败') || largeStatus.includes('出错'))
+    throw new Error(`large q4f16 档位加载直接失败：${largeStatus}`);
+  await pg.screenshot({ path: path.join(outDir, 'person-large-download.png') });
+  console.log('[large] 断言通过：large q4f16 档位进入下载/初始化流程（未等全量下载，取舍同 base）');
+  await pg.close();
+
+  console.log('\nPASS: 仅人物分割（真实链路/合成逻辑/失败回退）+ NC 警示 + base/large 档位 全部通过');
 } finally {
   await context.close();
 }

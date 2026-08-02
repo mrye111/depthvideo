@@ -207,7 +207,7 @@ const DICTS: Record<Lang, Record<string, string>> = {
     "error.trimStripFailed": "胶片条加载失败",
     "status.badFileType": "不支持的文件格式，请选择 mp4 / webm / mov 视频（仅 1 个）。",
     "status.segFallback": "人物分割不可用，已回退为全图处理。",
-    "nc.warning": "⚠ V2 Base 模型许可证为 CC-BY-NC-4.0，仅供学习研究，禁止商用。",
+    "nc.warning": "⚠ 当前模型许可证为 CC-BY-NC-4.0，仅供学习研究，禁止商用。",
   },
   en: {
     "doc.title": "Video Depth Extraction · Depth Video",
@@ -407,7 +407,7 @@ const DICTS: Record<Lang, Record<string, string>> = {
     "error.trimStripFailed": "Failed to load filmstrip",
     "status.badFileType": "Unsupported file type. Choose an mp4 / webm / mov video (1 only).",
     "status.segFallback": "Person segmentation unavailable — falling back to full frame.",
-    "nc.warning": "⚠ The V2 Base model is licensed CC-BY-NC-4.0 — for study and research only, no commercial use.",
+    "nc.warning": "⚠ The selected model is licensed CC-BY-NC-4.0 — for study and research only, no commercial use.",
   },
 };
 
