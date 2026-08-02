@@ -5,11 +5,16 @@
  * 行为按 research/inference-pipeline.md 与 research/video-export-pipeline.md 1:1 复刻：
  * 主线程推理 + 每帧 requestAnimationFrame 让出；单线程 WASM（无 COOP/COEP）；
  * Cache API 键 transformers-cache-v2；HTML 假响应拦截与缓存清理。
- * 导出（MP4/WebM）、样式/平滑/仅人物、胶片条裁剪 UI 在后续片实现；
- * 本片裁剪仅维护入点/出点状态（默认全片），帧循环读取该状态。
+ * 片3：MP4/WebM 导出链路。行为照 research/video-export-pipeline.md §2/§3 1:1 复刻：
+ * 主路径 WebCodecs VideoEncoder（10 个 avc1 候选逐级探测，bitrate=clamp(1.5M,w*h*fps*0.1,40M)，
+ * avc:{format:'avc'}，关键帧每 2s，encodeQueueSize>8 flush 背压）+ mp4-muxer ArrayBufferTarget；
+ * 无 VideoEncoder/VideoFrame 或 avc1 全不支持时降级 captureStream(fps)+MediaRecorder（vp9→vp8→webm，
+ * start(1000)，帧间 sleep(1000/fps) 按墙钟喂帧）；导出卡 idle/busy/ok/warn 4 态与文案照原站。
+ * 样式/平滑/仅人物、胶片条裁剪 UI 在后续片实现；本片裁剪仅维护入点/出点状态（默认全片）。
  */
 import { pipeline, env, RawImage } from '@huggingface/transformers';
 import type { DepthEstimationPipeline, DepthEstimationOutput } from '@huggingface/transformers';
+import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 
 // ---------------------------------------------------------------------------
 // transformers.js 环境（照抄原站：ModelScope 默认源 + 缓存键 + 单线程 WASM）
@@ -109,6 +114,12 @@ let liveFrameText: HTMLSpanElement;
 let outputMeta: HTMLElement;
 let frameMeta: HTMLElement;
 let speedMeta: HTMLElement;
+let resultVideo: HTMLVideoElement;
+let exportSlot: HTMLDivElement;
+let exportCard: HTMLDivElement;
+let exportStatusLabel: HTMLElement;
+let exportStatusDetail: HTMLElement;
+let downloadButton: HTMLButtonElement;
 let modelSelect: HTMLSelectElement;
 let deviceSelect: HTMLSelectElement;
 let sizeSelect: HTMLSelectElement;
@@ -139,6 +150,12 @@ function bindRefs(): void {
   outputMeta = $<HTMLElement>('outputMeta');
   frameMeta = $<HTMLElement>('frameMeta');
   speedMeta = $<HTMLElement>('speedMeta');
+  resultVideo = $<HTMLVideoElement>('resultVideo');
+  exportSlot = $<HTMLDivElement>('exportSlot');
+  exportCard = $<HTMLDivElement>('exportCard');
+  exportStatusLabel = $<HTMLElement>('exportStatusLabel');
+  exportStatusDetail = $<HTMLElement>('exportStatusDetail');
+  downloadButton = $<HTMLButtonElement>('downloadButton');
   modelSelect = $<HTMLSelectElement>('modelSelect');
   deviceSelect = $<HTMLSelectElement>('deviceSelect');
   sizeSelect = $<HTMLSelectElement>('sizeSelect');
@@ -168,6 +185,7 @@ const S = {
   titleDownloading: '下载模型',
   titleGenerating: '生成中',
   titleCancelling: '取消中',
+  titleMuxing: '封装中',
   titleDone: '完成',
   titleCancelled: '已取消',
   titleError: '出错',
@@ -191,6 +209,26 @@ const S = {
     `处理中：${done}/${total} 帧。输出窗口实时刷新深度图，时间轴固定 ${fps}fps。`,
   framesFps: (done: number, total: number, fps: string) => `${done}/${total} 帧 · ${fps} fps`,
   doneFrames: (frames: number, fps: number) => `已生成 ${frames} 帧 · ${fps}fps`,
+  doneWithFormat: (frames: number, fps: number, format: string) =>
+    `完成：已生成 ${frames} 帧、${fps}fps 的 ${format} 深度视频。可点击下方下载或同步播放对比。`,
+  fallbackWebm: (start: string, end: string) =>
+    `当前浏览器不支持 WebCodecs，已切换为 WebM。处理 ${start}s–${end}s...`,
+  noMediaRecorder: '当前浏览器不支持 MediaRecorder 视频编码。',
+  exportIdleLabel: '等待开始',
+  exportIdleDetail: '选择视频后点击开始，完成后可在此下载',
+  exportReadyDetail: '视频已就绪，可拖动底部手柄裁剪后再开始',
+  exportBusy: '转换中',
+  exportPrepare: '正在准备模型与编码器...',
+  exportGenerating: '正在逐帧生成深度图...',
+  exportMuxing: '正在封装 MP4 文件...',
+  exportSuccess: '转换成功',
+  exportSuccessDetail: (frames: number, fps: number, format: string) =>
+    `已生成 ${frames} 帧 · ${fps}fps · ${format}`,
+  exportCancelled: '已取消',
+  exportCancelledDetail: '可以调整参数后重新开始',
+  exportCancelling: '正在取消',
+  exportCancellingDetail: '当前帧结束后停止...',
+  exportFailed: '转换失败',
   cancelling: '正在取消，当前帧结束后停止...',
   cancelled: '已取消。可以调整参数后重新开始。',
   aborted: '用户取消',
@@ -250,6 +288,9 @@ let depthPipe: DepthEstimationPipeline | null = null;
 let depthPipeKey = '';
 let cancelled = false;
 let processing = false;
+/** 最近一次完成导出的产物（供下载按钮使用） */
+let resultUrl: string | null = null;
+let resultName = '';
 
 const processCanvas = document.createElement('canvas');
 const processCtx = processCanvas.getContext('2d', { willReadFrequently: true })!;
@@ -378,6 +419,7 @@ async function loadVideo(file: File): Promise<void> {
   trimStart = 0;
   trimEnd = videoDuration;
 
+  clearResult();
   inputEmpty.hidden = true;
   sourceVideo.hidden = false;
   inputBadge.textContent = S.badgeLoaded;
@@ -385,6 +427,8 @@ async function loadVideo(file: File): Promise<void> {
   sourceFileName.title = file.name;
   sourceMeta.textContent = `${sourceVideo.videoWidth}×${sourceVideo.videoHeight} · ${videoDuration.toFixed(2)}s`;
 
+  exportSlot.hidden = false;
+  setExportCard(S.exportIdleLabel, S.exportReadyDetail, 'idle');
   progressTitle.textContent = '等待中';
   statusLine.textContent = S.videoReady;
   startButton.disabled = false;
@@ -526,6 +570,227 @@ function computeOutputSize(): { w: number; h: number } {
 }
 
 // ---------------------------------------------------------------------------
+// 导出：MP4（WebCodecs + mp4-muxer）主路径 / WebM（MediaRecorder）降级
+// （research/video-export-pipeline.md §2/§3）
+// ---------------------------------------------------------------------------
+type ExportSession = {
+  format: 'MP4' | 'WebM';
+  /** 每帧渲染到 depthCanvas 后调用；MP4 编码 VideoFrame，WebM 按墙钟 sleep */
+  encodeFrame(index: number): Promise<void>;
+  /** 正常结束：flush/封装，产出 Blob */
+  finalize(): Promise<Blob>;
+  /** 取消/出错时中止：关 encoder / 停 recorder 与轨道，幂等 */
+  abort(): void;
+};
+
+/** 导出卡 4 态：idle/busy/ok/warn（原站 BG 函数；取消与出错同为 warn） */
+function setExportCard(label: string, detail: string, state: string, showDownload = false): void {
+  exportCard.className = `export-card export-${state}`;
+  exportStatusLabel.textContent = label;
+  exportStatusDetail.textContent = detail;
+  downloadButton.hidden = !showDownload;
+  downloadButton.disabled = !showDownload || !resultUrl;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 逐级探测 H.264 编码配置（原站 gG 函数）：
+ * bitrate = clamp(1.5Mbps, w*h*fps*0.1, 40Mbps)，10 个 avc1 候选，全部不支持返回 null → 降级 WebM。
+ */
+async function probeEncoderConfig(
+  w: number,
+  h: number,
+  fps: number,
+): Promise<VideoEncoderConfig | null> {
+  const bitrate = Math.min(4e7, Math.max(15e5, Math.round(w * h * fps * 0.1)));
+  const candidates = [
+    'avc1.42001f',
+    'avc1.4d001f',
+    'avc1.420028',
+    'avc1.4d0028',
+    'avc1.640028',
+    'avc1.4d0029',
+    'avc1.640029',
+    'avc1.640032',
+    'avc1.640033',
+    'avc1.640034',
+  ];
+  for (const codec of candidates) {
+    const cfg: VideoEncoderConfig = {
+      codec,
+      width: w,
+      height: h,
+      framerate: fps,
+      bitrate,
+      avc: { format: 'avc' },
+    };
+    try {
+      const support = await VideoEncoder.isConfigSupported(cfg);
+      if (support.supported) return support.config ?? cfg;
+    } catch {
+      /* 探测异常视为不支持，继续下一候选 */
+    }
+  }
+  return null;
+}
+
+/** MP4 会话：ArrayBufferTarget 内存拼装 + 关键帧每 2s + encodeQueueSize>8 flush 背压，无音频轨 */
+async function createMp4Session(
+  w: number,
+  h: number,
+  fps: number,
+  total: number,
+): Promise<ExportSession | null> {
+  if (!('VideoEncoder' in window) || !('VideoFrame' in window)) return null;
+  const config = await probeEncoderConfig(w, h, fps);
+  if (!config) return null;
+
+  const target = new ArrayBufferTarget();
+  const muxer = new Muxer({
+    target,
+    video: { codec: 'avc', width: w, height: h, frameRate: fps },
+    fastStart: { expectedVideoChunks: total },
+    firstTimestampBehavior: 'strict',
+  });
+  let encErr: Error | null = null;
+  const encoder = new VideoEncoder({
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+    error: (e) => {
+      encErr = e instanceof Error ? e : new Error(String(e));
+    },
+  });
+  encoder.configure(config);
+  const frameUs = Math.round(1e6 / fps);
+  let closed = false;
+
+  return {
+    format: 'MP4',
+    async encodeFrame(index) {
+      if (encErr) throw encErr;
+      const frame = new VideoFrame(depthCanvas, {
+        timestamp: index * frameUs,
+        duration: frameUs,
+      });
+      encoder.encode(frame, { keyFrame: index % Math.max(1, fps * 2) === 0 });
+      frame.close();
+      if (encoder.encodeQueueSize > 8) await encoder.flush();
+    },
+    async finalize() {
+      if (encErr) throw encErr;
+      await encoder.flush();
+      encoder.close();
+      closed = true;
+      muxer.finalize();
+      return new Blob([target.buffer], { type: 'video/mp4' });
+    },
+    abort() {
+      if (!closed && encoder.state !== 'closed') {
+        closed = true;
+        try {
+          encoder.close();
+        } catch {
+          /* 已关闭 */
+        }
+      }
+    },
+  };
+}
+
+/** WebM 降级会话：captureStream(fps) + MediaRecorder，mimeType vp9→vp8→webm，start(1000) */
+function createWebMSession(fps: number): ExportSession {
+  const mimeType =
+    ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) =>
+      MediaRecorder.isTypeSupported(m),
+    ) || '';
+  if (!mimeType) throw new Error(S.noMediaRecorder);
+
+  const stream = depthCanvas.captureStream(fps);
+  const recorder = new MediaRecorder(stream, { mimeType });
+  const chunks: Blob[] = [];
+  recorder.ondataavailable = (e) => {
+    if (e.data.size > 0) chunks.push(e.data);
+  };
+  recorder.start(1000);
+  const frameMs = Math.round(1000 / fps);
+  let stopped = false;
+  const stopTracks = () => {
+    for (const track of stream.getTracks()) track.stop();
+  };
+
+  return {
+    format: 'WebM',
+    async encodeFrame() {
+      // captureStream 按 fps 实时抓画布，必须按墙钟节奏停留
+      await sleep(frameMs);
+    },
+    async finalize() {
+      recorder.stop();
+      stopped = true;
+      await new Promise<void>((r) => recorder.addEventListener('stop', () => r(), { once: true }));
+      stopTracks();
+      return new Blob(chunks, { type: mimeType });
+    },
+    abort() {
+      if (!stopped) {
+        stopped = true;
+        try {
+          if (recorder.state !== 'inactive') recorder.stop();
+        } catch {
+          /* 已停止 */
+        }
+        stopTracks();
+      }
+    },
+  };
+}
+
+/** 导出完成：产物入库、导出卡 ok、结果视频可回放、可下载（原站 qW/XW） */
+function finishExport(frames: number, fps: number, format: string, blob: Blob): void {
+  if (resultUrl) URL.revokeObjectURL(resultUrl);
+  resultUrl = URL.createObjectURL(blob);
+  const base = videoFile?.name.replace(/\.[^.]+$/, '') || 'depth-video';
+  resultName = `${base}-depth-${fps}fps.${format === 'MP4' ? 'mp4' : 'webm'}`;
+
+  liveFrameTag.hidden = true;
+  depthCanvas.hidden = true;
+  outputEmpty.hidden = true;
+  resultVideo.hidden = false;
+  resultVideo.src = resultUrl;
+  resultVideo.load();
+
+  setExportCard(S.exportSuccess, S.exportSuccessDetail(frames, fps, format), 'ok', true);
+  outputBadge.textContent = S.badgeDone;
+  progressTitle.textContent = S.titleDone;
+  statusLine.textContent = S.doneWithFormat(frames, fps, format);
+  setProgress(100);
+}
+
+function downloadResult(): void {
+  if (!resultUrl) return;
+  const a = document.createElement('a');
+  a.href = resultUrl;
+  a.download = resultName;
+  document.body.append(a);
+  a.click();
+  a.remove();
+}
+
+/** 清理上一次导出产物并复位结果视频 */
+function clearResult(): void {
+  if (resultUrl) {
+    URL.revokeObjectURL(resultUrl);
+    resultUrl = null;
+  }
+  resultName = '';
+  resultVideo.hidden = true;
+  resultVideo.removeAttribute('src');
+  resultVideo.load();
+}
+
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 async function startProcessing(): Promise<void> {
@@ -536,7 +801,10 @@ async function startProcessing(): Promise<void> {
   cancelButton.disabled = false;
   progressTrack.classList.add('is-active');
   setProgress(0);
+  setExportCard(S.exportBusy, S.exportPrepare, 'busy');
 
+  let session: ExportSession | null = null;
+  let sessionDone = false;
   try {
     progressTitle.textContent = S.titlePreparing;
     statusLine.textContent = '正在准备模型...';
@@ -551,6 +819,7 @@ async function startProcessing(): Promise<void> {
     depthCanvas.height = h;
 
     outputEmpty.hidden = true;
+    resultVideo.hidden = true;
     depthCanvas.hidden = false;
     liveFrameTag.hidden = false;
     outputBadge.textContent = S.badgeConverting;
@@ -560,8 +829,18 @@ async function startProcessing(): Promise<void> {
     const end = Math.min(Math.max(trimStart + 0.1, trimEnd), videoDuration);
     const clipDuration = end - start;
     const total = Math.max(1, Math.ceil(clipDuration * fps));
+
+    // 编码路径：优先 MP4（WebCodecs），不可用则降级 WebM（MediaRecorder）
+    session = await createMp4Session(w, h, fps, total);
     progressTitle.textContent = S.titleGenerating;
-    statusLine.textContent = S.startFrames(start.toFixed(1), end.toFixed(1), total);
+    if (session) {
+      statusLine.textContent = S.startFrames(start.toFixed(1), end.toFixed(1), total);
+      setExportCard(S.exportBusy, S.exportGenerating, 'busy');
+    } else {
+      statusLine.textContent = S.fallbackWebm(start.toFixed(1), end.toFixed(1));
+      setExportCard(S.exportBusy, S.exportGenerating, 'busy');
+      session = createWebMSession(fps);
+    }
 
     const t0 = performance.now();
     for (let i = 0; i < total; i++) {
@@ -571,6 +850,7 @@ async function startProcessing(): Promise<void> {
       processCtx.drawImage(sourceVideo, 0, 0, w, h);
       const output = (await pipe(RawImage.fromCanvas(processCanvas))) as DepthEstimationOutput;
       renderDepthGray(output.depth);
+      await session.encodeFrame(i);
 
       const done = i + 1;
       const instantFps = done / ((performance.now() - t0) / 1000);
@@ -582,14 +862,20 @@ async function startProcessing(): Promise<void> {
       await nextFrame();
     }
 
-    outputBadge.textContent = S.badgeDone;
-    progressTitle.textContent = S.titleDone;
-    statusLine.textContent = S.doneFrames(total, fps);
+    if (session.format === 'MP4') {
+      progressTitle.textContent = S.titleMuxing;
+      statusLine.textContent = S.exportMuxing;
+      setExportCard(S.exportBusy, S.exportMuxing, 'busy');
+    }
+    const blob = await session.finalize();
+    sessionDone = true;
+    finishExport(total, fps, session.format, blob);
   } catch (e) {
     if (isCancelError(e)) {
       outputBadge.textContent = S.badgeCancelled;
       progressTitle.textContent = S.titleCancelled;
       statusLine.textContent = S.cancelled;
+      setExportCard(S.exportCancelled, S.exportCancelledDetail, 'warn');
     } else {
       console.error('处理失败', e);
       outputBadge.textContent = S.badgeError;
@@ -599,8 +885,10 @@ async function startProcessing(): Promise<void> {
         ? S.fetchHint
         : '';
       statusLine.textContent = S.failWithHint(message, hint);
+      setExportCard(S.exportFailed, message, 'warn');
     }
   } finally {
+    if (!sessionDone) session?.abort();
     processing = false;
     startButton.disabled = !videoFile;
     cancelButton.disabled = true;
@@ -613,6 +901,7 @@ function cancelProcessing(): void {
   cancelled = true;
   progressTitle.textContent = S.titleCancelling;
   statusLine.textContent = S.cancelling;
+  setExportCard(S.exportCancelling, S.exportCancellingDetail, 'warn');
   cancelButton.disabled = true;
 }
 
@@ -645,6 +934,7 @@ export function initApp(): void {
 
   startButton.addEventListener('click', () => void startProcessing());
   cancelButton.addEventListener('click', cancelProcessing);
+  downloadButton.addEventListener('click', downloadResult);
   modelSelect.addEventListener('change', () => void refreshCacheHint());
   deviceSelect.addEventListener('change', () => void refreshCacheHint());
 
