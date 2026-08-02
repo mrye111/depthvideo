@@ -22,6 +22,10 @@
  * person 通道（labels 正则，缺省 masks[1]，再缺省 masks[0]）float32→0-255 灰度，alpha>128 硬阈值合成，
  * 背景按 personBgSelect 涂黑/保留原图；加载或单帧分割失败回退全白掩码（=全图），不中断处理；
  * 分割与深度推理在同一帧循环内串行 await（先深度后分割）。base 选项旁显示 CC-BY-NC 非商用警示。
+ * 片6：i18n 接入。全部动态文案走 src/i18n.ts 双字典（zh/en 195 key 逐字照原站），
+ * 状态类文案以 token（key+params）记录，语言切换时按 token 重渲染（原站 HW 函数行为）；
+ * 模型下拉选项与缓存提示按原站 eK/iU 重渲染（含 ✓ 已缓存后缀与 {device} · 缓存统计）；
+ * env.fetch 防护对齐原站 tU（仅 ok 响应、clone 读取、config/preprocessor/tokenizer 文件名正则）。
  */
 import { pipeline, env, RawImage } from '@huggingface/transformers';
 import type {
@@ -31,6 +35,7 @@ import type {
 } from '@huggingface/transformers';
 import { FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
+import { t, getLang, setLang, applyI18n, applyDocMeta, syncLangButtons } from './i18n';
 
 // ---------------------------------------------------------------------------
 // transformers.js 环境（照抄原站：ModelScope 默认源 + 缓存键 + 单线程 WASM）
@@ -53,26 +58,26 @@ if (onnxWasmEnv) {
     : 1;
 }
 
-/** 防镜像站返回 HTML 错误页：text/html 响应与「内容以 < 开头的 json/config」改写为 404 */
+/** 防镜像站返回 HTML 错误页（原站 tU）：仅检查 ok 响应；text/html 与
+ *  「内容以 < 开头的 json/config 类文件」改写为 404，clone 读取不消耗原响应 */
 const nativeFetch = window.fetch.bind(window);
+const HTML_BODY_RE = /^\s*</;
 env.fetch = async (input: string | URL, init?: unknown) => {
   const resp = await nativeFetch(input as RequestInfo | URL, init as RequestInit | undefined);
+  if (!resp.ok) return resp;
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : String(input);
   const contentType = resp.headers.get('content-type') ?? '';
   if (contentType.includes('text/html')) {
     return new Response('Not Found', { status: 404, statusText: 'HTML response rejected' });
   }
-  if (/\.json(\?|#|$)/i.test(url)) {
-    const buf = await resp.arrayBuffer();
-    const head = new TextDecoder().decode(buf.slice(0, 64)).trimStart();
-    if (head.startsWith('<')) {
-      return new Response('Not Found', { status: 404, statusText: 'HTML-in-JSON rejected' });
+  if (
+    /\.json(\?|$)/i.test(url) ||
+    /(?:^|\/)(config|preprocessor_config|tokenizer_config)\.json/i.test(url)
+  ) {
+    const buf = await resp.clone().arrayBuffer();
+    if (HTML_BODY_RE.test(new TextDecoder().decode(buf.slice(0, 64)))) {
+      return new Response('Not Found', { status: 404, statusText: 'HTML response rejected' });
     }
-    return new Response(buf, {
-      status: resp.status,
-      statusText: resp.statusText,
-      headers: resp.headers,
-    });
   }
   return resp;
 };
@@ -120,6 +125,7 @@ let fileInput: HTMLInputElement;
 let sourceVideo: HTMLVideoElement;
 let inputEmpty: HTMLDivElement;
 let inputBadge: HTMLSpanElement;
+let pickVideoLabel: HTMLSpanElement;
 let sourceFileName: HTMLElement;
 let sourceMeta: HTMLElement;
 let outputBadge: HTMLSpanElement;
@@ -175,6 +181,7 @@ function bindRefs(): void {
   sourceVideo = $<HTMLVideoElement>('sourceVideo');
   inputEmpty = $<HTMLDivElement>('inputEmpty');
   inputBadge = $<HTMLSpanElement>('inputBadge');
+  pickVideoLabel = $<HTMLSpanElement>('pickVideoLabel');
   sourceFileName = $<HTMLElement>('sourceFileName');
   sourceMeta = $<HTMLElement>('sourceMeta');
   outputBadge = $<HTMLSpanElement>('outputBadge');
@@ -227,97 +234,98 @@ function bindRefs(): void {
 }
 
 // ---------------------------------------------------------------------------
-// 文案（取自 research-snapshot/cn_strings.txt，逐字）
+// 动态文案：全部走 i18n 双字典（src/i18n.ts，key 逐字照原站）。
+// 状态类文案以 token（key + 插值参数）记录当前值，语言切换时按 token 重渲染
+// （原站 HW 函数行为）；raw 用于错误消息等字典外原文。
 // ---------------------------------------------------------------------------
-const S = {
-  badgeLoaded: '已载入',
-  badgeConverting: '转换中',
-  badgeDone: '已完成',
-  badgeCancelled: '已取消',
-  badgeError: '出错',
-  titlePreparing: '准备中',
-  titleDownloading: '下载模型',
-  titleGenerating: '生成中',
-  titleCancelling: '取消中',
-  titleMuxing: '封装中',
-  titleDone: '完成',
-  titleCancelled: '已取消',
-  titleError: '出错',
-  videoReady: '视频已准备好，可裁剪区间后点击开始生成。',
-  metadataTimeout: '读取视频元数据超时',
-  videoReadFail: '视频读取失败',
-  badFileType: '不支持的文件格式，请选择 mp4 / webm / mov 视频（仅 1 个）。',
-  firstDownload: (host: string, name: string, size: string) =>
-    `首次使用，正在从 ${host} 下载 ${name}（${size}）...`,
-  cachedLoad: (device: string, size: string) =>
-    `模型已缓存。正在快速读入并初始化 ${device}（${size}）...`,
-  downloading: (pct: number, sec: number) => `正在下载模型（${pct}% · 已用 ${sec}s）...`,
-  downloaded: (device: string, dtype: string) =>
-    `模型已下载完成，正在初始化 ${device}/${dtype}...`,
-  initTimeout: (model: string, device: string, dtype: string) =>
-    `${model} (${device}/${dtype}) 初始化超时。可切换到 WASM，或取消后重试。`,
-  tryNext: '加载失败，尝试下一候选...',
-  startFrames: (start: string, end: string, frames: number) =>
-    `开始逐帧生成深度图（${start}s–${end}s · 共 ${frames} 帧）...`,
-  processing: (done: number, total: number, fps: number) =>
-    `处理中：${done}/${total} 帧。输出窗口实时刷新深度图，时间轴固定 ${fps}fps。`,
-  framesFps: (done: number, total: number, fps: string) => `${done}/${total} 帧 · ${fps} fps`,
-  doneFrames: (frames: number, fps: number) => `已生成 ${frames} 帧 · ${fps}fps`,
-  doneWithFormat: (frames: number, fps: number, format: string) =>
-    `完成：已生成 ${frames} 帧、${fps}fps 的 ${format} 深度视频。可点击下方下载或同步播放对比。`,
-  fallbackWebm: (start: string, end: string) =>
-    `当前浏览器不支持 WebCodecs，已切换为 WebM。处理 ${start}s–${end}s...`,
-  noMediaRecorder: '当前浏览器不支持 MediaRecorder 视频编码。',
-  exportIdleLabel: '等待开始',
-  exportIdleDetail: '选择视频后点击开始，完成后可在此下载',
-  exportReadyDetail: '视频已就绪，可拖动底部手柄裁剪后再开始',
-  exportBusy: '转换中',
-  exportPrepare: '正在准备模型与编码器...',
-  exportGenerating: '正在逐帧生成深度图...',
-  exportMuxing: '正在封装 MP4 文件...',
-  exportSuccess: '转换成功',
-  exportSuccessDetail: (frames: number, fps: number, format: string) =>
-    `已生成 ${frames} 帧 · ${fps}fps · ${format}`,
-  exportCancelled: '已取消',
-  exportCancelledDetail: '可以调整参数后重新开始',
-  exportCancelling: '正在取消',
-  exportCancellingDetail: '当前帧结束后停止...',
-  exportFailed: '转换失败',
-  cancelling: '正在取消，当前帧结束后停止...',
-  cancelled: '已取消。可以调整参数后重新开始。',
-  aborted: '用户取消',
-  failWithHint: (message: string, hint: string) => `处理失败：${message}${hint}`,
-  fetchHint:
-    '（无法下载模型。请硬刷新后确认下载源为 modelscope.cn；若仍失败可改官方源并开代理，或在 Application → Cache Storage 删除 transformers-cache* 后重试。）',
-  unknownError: '未知错误',
-  seekTimeout: (time: string) => `跳转到 ${time}s 超时`,
-  seekFail: '视频 seek 失败',
-  gpuOk: '硬件加速：支持 WebGPU ✓',
-  gpuWasm: '硬件加速：WASM 模式',
-  cacheYes: '✓ 已缓存',
-  cacheNo: '尚未缓存',
-  rangeSelected: (start: string, end: string, duration: string, frames: number) =>
-    `已选：${start}s – ${end}s（${duration}秒 ≈ ${frames}帧）`,
-  rangeEmpty: '已选：—',
-  stripFail: '胶片条加载失败',
-  stripTimeout: '胶片条加载超时',
-  syncPlay: '同步播放',
-  stopSync: '停止同步',
-  segPrepare: '正在准备人物分割模型...',
-  segLoadingMp: (label: string) => `仅人物：正在加载 MediaPipe ${label}（官方）...`,
-  segLoadingTf: '仅人物：正在加载 Transformers ONNX 人像分割...',
-  segInitMp: (sec: number) => `正在初始化 MediaPipe 分割模型（已用 ${sec}s）...`,
-  segDownloading: (pct: number, sec: number) => `正在下载分割模型（${pct}% · 已用 ${sec}s）...`,
-  mpWasmTimeout: 'MediaPipe WASM 加载超时。请检查网络后重试。',
-  mpGpuTimeout: 'MediaPipe 分割模型初始化超时（GPU）。',
-  mpCpuTimeout: 'MediaPipe 分割模型初始化超时（CPU）。',
-  mpGpuFallback: 'MediaPipe GPU 不可用，改用 CPU...',
-  segFallback: '人物分割不可用，已回退为全图处理。',
+type Params = Record<string, string | number>;
+type Dyn = { key: string; params?: Params } | { raw: string };
+
+function renderDyn(d: Dyn): string {
+  return 'raw' in d ? d.raw : t(d.key, d.params);
+}
+
+let statusDyn: Dyn = { key: 'footer.idleHint' };
+let titleDyn: Dyn = { key: 'footer.waiting' };
+let inputBadgeDyn: Dyn = { key: 'badge.noVideo' };
+let outputBadgeDyn: Dyn = { key: 'badge.waiting' };
+let exportDyn: { label: Dyn; detail: Dyn; state: string } = {
+  label: { key: 'export.idleLabel' },
+  detail: { key: 'export.idleDetail' },
+  state: 'idle',
 };
+let frameMetaDyn: Dyn | null = null;
+
+function setStatus(d: Dyn): void {
+  statusDyn = d;
+  statusLine.textContent = renderDyn(d);
+}
+
+function setTitle(d: Dyn): void {
+  titleDyn = d;
+  progressTitle.textContent = renderDyn(d);
+}
+
+function setInputBadge(d: Dyn): void {
+  inputBadgeDyn = d;
+  inputBadge.textContent = renderDyn(d);
+  inputBadge.className = 'key' in d && d.key === 'badge.loaded' ? 'chip chip-ok' : 'chip';
+}
+
+function setOutputBadge(d: Dyn): void {
+  outputBadgeDyn = d;
+  outputBadge.textContent = renderDyn(d);
+}
 
 // ---------------------------------------------------------------------------
-// 模型表（research/inference-pipeline.md §2）
+// 模型表（research/inference-pipeline.md §2，原站 KH 常量：2 模型 × fp16/fp32）
 // ---------------------------------------------------------------------------
+type ModelOption = {
+  id: string;
+  dtype: 'fp16' | 'fp32';
+  /** 下拉显示名（语言中性，含 f16/f32 后缀） */
+  name: string;
+  /** 下载量标注（MB 数字） */
+  mb: number;
+  /** 是否带「推荐」标记（仅 small fp16 档） */
+  recommended: boolean;
+  cachedBytesThreshold: number;
+  timeoutMs: number;
+};
+
+const MODEL_OPTIONS: ModelOption[] = (
+  [
+    {
+      id: 'onnx-community/depth-anything-v2-small-ONNX',
+      base: 'V2 Small · ONNX',
+      recommended: true,
+      sizes: { fp16: 48, fp32: 94 },
+      timeoutMs: 180_000,
+    },
+    {
+      id: 'onnx-community/depth-anything-v2-base-ONNX',
+      base: 'V2 Base · ONNX',
+      recommended: false,
+      sizes: { fp16: 187, fp32: 371 },
+      timeoutMs: 360_000,
+    },
+  ] as const
+).flatMap((m) =>
+  (['fp16', 'fp32'] as const).map((dtype) => ({
+    id: m.id,
+    dtype,
+    name: `${m.base} · ${dtype === 'fp16' ? 'f16' : 'f32'}`,
+    mb: m.sizes[dtype],
+    recommended: m.recommended && dtype === 'fp16',
+    cachedBytesThreshold: dtype === 'fp16' ? 20e6 : 40e6,
+    timeoutMs: m.timeoutMs,
+  })),
+);
+
+function modelOptionOf(key: string): ModelOption {
+  return MODEL_OPTIONS.find((o) => `${o.id}::${o.dtype}` === key) ?? MODEL_OPTIONS[0];
+}
+
 type ModelSpec = {
   id: string;
   dtype: string;
@@ -328,16 +336,14 @@ type ModelSpec = {
 };
 
 function currentModelSpec(): ModelSpec {
-  const [id, dtype] = modelSelect.value.split('::');
-  const isBase = id.includes('-base');
-  const isFp16 = dtype === 'fp16';
+  const o = modelOptionOf(modelSelect.value);
   return {
-    id,
-    dtype,
-    name: isBase ? 'V2 Base · ONNX' : 'V2 Small · ONNX',
-    size: isBase ? (isFp16 ? '~187MB' : '~371MB') : isFp16 ? '~48MB' : '~94MB',
-    cachedBytesThreshold: isFp16 ? 20e6 : 40e6,
-    timeoutMs: isBase ? 360_000 : 180_000,
+    id: o.id,
+    dtype: o.dtype,
+    name: o.name,
+    size: `~${o.mb}MB`,
+    cachedBytesThreshold: o.cachedBytesThreshold,
+    timeoutMs: o.timeoutMs,
   };
 }
 
@@ -399,7 +405,11 @@ function nextFrame(): Promise<void> {
 
 function isCancelError(e: unknown): boolean {
   const s = String(e);
-  return s.includes(S.aborted) || s.includes('Cancelled by user');
+  return (
+    s.includes(t('status.aborted')) ||
+    s.includes('用户取消') ||
+    s.includes('Cancelled by user')
+  );
 }
 
 function setProgress(pct: number): void {
@@ -433,11 +443,79 @@ async function probeCached(spec: ModelSpec, modelId: string): Promise<boolean> {
   }
 }
 
-async function refreshCacheHint(): Promise<void> {
-  const spec = currentModelSpec();
-  modelCacheHint.textContent = '';
-  const cached = await probeCached(spec, spec.id);
-  modelCacheHint.textContent = cached ? S.cacheYes : S.cacheNo;
+/** 字节数格式化（缓存提示「本地 {bytes}」用） */
+function fmtBytes(bytes: number): string {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)}GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)}MB`;
+  return `${Math.round(bytes / 1e3)}KB`;
+}
+
+/** 原站 $G：聚合 4 档模型选项的缓存命中（权重字节数超阈值 + config.json 存在）与总占用字节数 */
+async function probeAllCached(): Promise<{ cachedKeys: Set<string>; occupiedBytes: number }> {
+  const cachedKeys = new Set<string>();
+  let occupiedBytes = 0;
+  if (!('caches' in window)) return { cachedKeys, occupiedBytes };
+  try {
+    const cache = await caches.open(CACHE_KEY);
+    const keys = await cache.keys();
+    for (const opt of MODEL_OPTIONS) {
+      const onnxRe =
+        opt.dtype === 'fp16'
+          ? /\/onnx\/model_fp16\.onnx(_data)?(\?|$)/i
+          : /\/onnx\/model\.onnx(\?|$)/i;
+      let bytes = 0;
+      let hasConfig = false;
+      for (const req of keys) {
+        if (!req.url.includes(`/${opt.id}/`)) continue;
+        if (/config\.json(\?|$)/i.test(req.url)) hasConfig = true;
+        if (onnxRe.test(req.url)) {
+          const resp = await cache.match(req);
+          if (resp)
+            bytes += Number(resp.headers.get('content-length') ?? 0) || (await resp.blob()).size;
+        }
+      }
+      if (hasConfig && bytes > opt.cachedBytesThreshold) cachedKeys.add(`${opt.id}::${opt.dtype}`);
+      occupiedBytes += bytes;
+    }
+  } catch {
+    /* 探测失败按未缓存处理 */
+  }
+  return { cachedKeys, occupiedBytes };
+}
+
+/** 原站 iU：单选项文案 `{name}（~{size}MB{note}）`，命中缓存追加「· ✓ 已缓存」 */
+function renderModelOptions(cachedKeys: Set<string>): void {
+  const current = modelSelect.value;
+  for (const option of Array.from(modelSelect.options)) {
+    const opt = MODEL_OPTIONS.find((o) => `${o.id}::${o.dtype}` === option.value);
+    if (!opt) continue;
+    const note = opt.recommended
+      ? getLang() === 'zh'
+        ? `，${t('model.recommended')}`
+        : `, ${t('model.recommended')}`
+      : '';
+    option.textContent = t(
+      cachedKeys.has(`${opt.id}::${opt.dtype}`) ? 'model.optionCached' : 'model.option',
+      { name: opt.name, size: opt.mb, note },
+    );
+  }
+  modelSelect.value = current;
+}
+
+/** 原站 eK：重渲染模型下拉各选项（含缓存后缀）+ 缓存提示 {device} · 已缓存统计/尚未缓存 */
+async function refreshModelCacheUI(): Promise<void> {
+  const { cachedKeys, occupiedBytes } = await probeAllCached();
+  renderModelOptions(cachedKeys);
+  const device = deviceSelect.value;
+  modelCacheHint.textContent =
+    cachedKeys.size > 0
+      ? t('model.cacheHint', {
+          device,
+          cached: cachedKeys.size,
+          total: MODEL_OPTIONS.length,
+          bytes: fmtBytes(occupiedBytes),
+        })
+      : t('model.cacheEmpty', { device });
 }
 
 /** base 档位为 CC-BY-NC-4.0（非商用），选中时显示警示（#7 硬性要求） */
@@ -457,7 +535,7 @@ function waitMetadata(video: HTMLVideoElement): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error(S.metadataTimeout));
+      reject(new Error(t('error.metadataTimeout')));
     }, 10_000);
     const onReady = () => {
       cleanup();
@@ -465,7 +543,7 @@ function waitMetadata(video: HTMLVideoElement): Promise<void> {
     };
     const onError = () => {
       cleanup();
-      reject(new Error(S.videoReadFail));
+      reject(new Error(t('error.videoReadFailed')));
     };
     const cleanup = () => {
       clearTimeout(timer);
@@ -483,18 +561,18 @@ function waitMetadata(video: HTMLVideoElement): Promise<void> {
 
 async function loadVideo(file: File): Promise<void> {
   if (!isVideoFile(file)) {
-    statusLine.textContent = S.badFileType;
+    setStatus({ key: 'status.badFileType' });
     return;
   }
   if (videoUrl) URL.revokeObjectURL(videoUrl);
   videoUrl = URL.createObjectURL(file);
-  progressTitle.textContent = S.titlePreparing;
+  setTitle({ key: 'title.preparing' });
   try {
     sourceVideo.src = videoUrl;
     await waitMetadata(sourceVideo);
   } catch (e) {
-    progressTitle.textContent = S.titleError;
-    statusLine.textContent = (e as Error).message;
+    setTitle({ key: 'title.error' });
+    setStatus({ raw: (e as Error).message });
     return;
   }
   videoFile = file;
@@ -505,15 +583,16 @@ async function loadVideo(file: File): Promise<void> {
   clearResult();
   inputEmpty.hidden = true;
   sourceVideo.hidden = false;
-  inputBadge.textContent = S.badgeLoaded;
+  setInputBadge({ key: 'badge.loaded' });
+  pickVideoLabel.textContent = t('btn.reselect');
   sourceFileName.textContent = file.name;
   sourceFileName.title = file.name;
   sourceMeta.textContent = `${sourceVideo.videoWidth}×${sourceVideo.videoHeight} · ${videoDuration.toFixed(2)}s`;
 
   exportSlot.hidden = false;
-  setExportCard(S.exportIdleLabel, S.exportReadyDetail, 'idle');
-  progressTitle.textContent = '等待中';
-  statusLine.textContent = S.videoReady;
+  setExportCard({ key: 'export.idleLabel' }, { key: 'export.readyDetail' }, 'idle');
+  setTitle({ key: 'badge.waiting' });
+  setStatus({ key: 'status.ready' });
   startButton.disabled = false;
   stopSyncPlay();
   syncPlayButton.disabled = true;
@@ -525,15 +604,15 @@ async function loadVideo(file: File): Promise<void> {
 // ---------------------------------------------------------------------------
 // 逐帧 seek 解码（5s 超时，research/video-export-pipeline.md §1）
 // ---------------------------------------------------------------------------
-function seekVideo(t: number): Promise<void> {
+function seekVideo(target: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (Math.abs(sourceVideo.currentTime - t) < 0.01 && sourceVideo.readyState >= 2) {
+    if (Math.abs(sourceVideo.currentTime - target) < 0.01 && sourceVideo.readyState >= 2) {
       resolve();
       return;
     }
     const timer = setTimeout(() => {
       cleanup();
-      reject(new Error(S.seekTimeout(t.toFixed(2))));
+      reject(new Error(t('error.seekTimeout', { time: target.toFixed(2) })));
     }, 5_000);
     const onSeeked = () => {
       cleanup();
@@ -541,7 +620,7 @@ function seekVideo(t: number): Promise<void> {
     };
     const onError = () => {
       cleanup();
-      reject(new Error(S.seekFail));
+      reject(new Error(t('error.seekFailed')));
     };
     const cleanup = () => {
       clearTimeout(timer);
@@ -551,7 +630,7 @@ function seekVideo(t: number): Promise<void> {
     sourceVideo.addEventListener('seeked', onSeeked);
     sourceVideo.addEventListener('error', onError);
     sourceVideo.pause();
-    sourceVideo.currentTime = t;
+    sourceVideo.currentTime = target;
   });
 }
 
@@ -568,16 +647,17 @@ async function loadDepthModel(): Promise<DepthEstimationPipeline> {
   depthPipeKey = '';
 
   const host = new URL(env.remoteHost).host;
-  let lastErr: unknown = new Error(S.unknownError);
+  let lastErr: unknown = new Error(t('status.unknownError'));
   for (const variant of modelVariants(spec.id)) {
-    if (cancelled) throw new Error(S.aborted);
+    if (cancelled) throw new Error(t('status.aborted'));
     try {
       const cached = await probeCached(spec, variant);
-      modelCacheHint.textContent = cached ? S.cacheYes : S.cacheNo;
-      progressTitle.textContent = cached ? '读缓存' : S.titleDownloading;
-      statusLine.textContent = cached
-        ? S.cachedLoad(device, spec.size)
-        : S.firstDownload(host, spec.name, spec.size);
+      setTitle({ key: cached ? 'badge.readingCache' : 'title.downloadModel' });
+      setStatus(
+        cached
+          ? { key: 'status.loadCache', params: { device, size: spec.size } }
+          : { key: 'status.firstDownload', params: { host, name: spec.name, size: spec.size } },
+      );
 
       const t0 = performance.now();
       const fileProgress = new Map<string, { loaded: number; total: number }>();
@@ -605,27 +685,30 @@ async function loadDepthModel(): Promise<DepthEstimationPipeline> {
               }
               const pct = total > 0 ? Math.round((loaded / total) * 100) : 0;
               const sec = Math.round((performance.now() - t0) / 1000);
-              progressTitle.textContent = `下载模型 ${pct}%`;
-              statusLine.textContent = S.downloading(pct, sec);
+              setTitle({ key: 'export.downloadModelPct', params: { pct } });
+              setStatus({ key: 'status.downloadModel', params: { pct, sec } });
               setProgress(pct);
             } else if (info.status === 'done') {
-              statusLine.textContent = S.downloaded(device, spec.dtype);
+              setStatus({
+                key: 'status.modelReadyInit',
+                params: { device, dtype: spec.dtype },
+              });
             }
           },
         }),
         spec.timeoutMs,
-        () => new Error(S.initTimeout(variant, device, spec.dtype)),
+        () => new Error(t('status.modelTimeout', { model: variant, device, dtype: spec.dtype })),
       );
       depthPipe = pipe;
       depthPipeKey = key;
-      progressTitle.textContent = '初始化';
-      modelCacheHint.textContent = S.cacheYes;
+      setTitle({ key: 'title.init' });
+      void refreshModelCacheUI();
       return pipe;
     } catch (e) {
       if (isCancelError(e)) throw e;
       lastErr = e;
       console.warn(`模型候选 ${variant} 加载失败`, e);
-      statusLine.textContent = S.tryNext;
+      setStatus({ key: 'status.loadNextGeneric' });
     }
   }
   throw lastErr;
@@ -683,17 +766,17 @@ async function loadMpSegmenter(kind: string): Promise<ImageSegmenter | null> {
   closeSegmenter();
 
   const label = kind === 'mediapipe-landscape' ? 'Landscape' : 'Selfie';
-  statusLine.textContent = S.segLoadingMp(label);
+  setStatus({ key: 'status.segMp', params: { label } });
   const t0 = performance.now();
   const tick = setInterval(() => {
     if (cancelled) return;
-    statusLine.textContent = S.segInitMp(Math.round((performance.now() - t0) / 1000));
+    setStatus({ key: 'status.initMp', params: { sec: Math.round((performance.now() - t0) / 1000) } });
   }, 1000);
   try {
     const vision = await withTimeout(
       FilesetResolver.forVisionTasks(MP_WASM_URL),
       60_000,
-      () => new Error(S.mpWasmTimeout),
+      () => new Error(t('status.mpTimeoutWasm')),
     );
     const options = (delegate: 'GPU' | 'CPU') => ({
       baseOptions: { modelAssetPath: tflite, delegate },
@@ -705,15 +788,15 @@ async function loadMpSegmenter(kind: string): Promise<ImageSegmenter | null> {
       mpSegmenter = await withTimeout(
         ImageSegmenter.createFromOptions(vision, options('GPU')),
         120_000,
-        () => new Error(S.mpGpuTimeout),
+        () => new Error(t('status.mpTimeoutGpu')),
       );
     } catch (e) {
-      console.warn(`${S.mpGpuFallback}`, e);
-      statusLine.textContent = S.mpGpuFallback;
+      console.warn(t('status.mpCpuFallback'), e);
+      setStatus({ key: 'status.mpCpuFallback' });
       mpSegmenter = await withTimeout(
         ImageSegmenter.createFromOptions(vision, options('CPU')),
         180_000,
-        () => new Error(S.mpCpuTimeout),
+        () => new Error(t('status.mpTimeoutCpu')),
       );
     }
     mpSegmenterKey = key;
@@ -733,7 +816,7 @@ async function loadTfSegmenter(): Promise<BackgroundRemovalPipeline | null> {
   const key = `tf:${device}`;
   if (tfSegPipe && tfSegPipeKey === key) return tfSegPipe;
   closeSegmenter();
-  statusLine.textContent = S.segLoadingTf;
+  setStatus({ key: 'status.segTf' });
   const t0 = performance.now();
   try {
     tfSegPipe = (await pipeline('background-removal', TF_SEG_MODEL, {
@@ -743,10 +826,10 @@ async function loadTfSegmenter(): Promise<BackgroundRemovalPipeline | null> {
         if (cancelled) return;
         if (info.status === 'progress') {
           const pct = info.total ? Math.round(((info.loaded ?? 0) / info.total) * 100) : 0;
-          statusLine.textContent = S.segDownloading(
-            pct,
-            Math.round((performance.now() - t0) / 1000),
-          );
+          setStatus({
+            key: 'status.downloadSeg',
+            params: { pct, sec: Math.round((performance.now() - t0) / 1000) },
+          });
         }
       },
     })) as BackgroundRemovalPipeline;
@@ -762,11 +845,11 @@ async function loadTfSegmenter(): Promise<BackgroundRemovalPipeline | null> {
 /** 处理开始时按需加载分割模型；失败不抛出（segBroken 标记，全白掩码回退） */
 async function ensureSegmenter(): Promise<void> {
   if (personModeSelect.value !== 'person') return;
-  progressTitle.textContent = S.segPrepare;
+  setTitle({ key: 'export.prepareSeg' });
   const kind = segModelSelect.value;
   if (kind === 'transformers') await loadTfSegmenter();
   else await loadMpSegmenter(kind);
-  if (segBroken) statusLine.textContent = S.segFallback;
+  if (segBroken) setStatus({ key: 'status.segFallback' });
 }
 
 /** 单帧分割：对处理画布出掩码；推理异常回退全白掩码（不中断处理） */
@@ -956,7 +1039,7 @@ function fmt1(v: number): string {
 /** 按当前 trimStart/trimEnd 刷新遮罩/选区/手柄位置与「已选」文案 */
 function updateTrimUI(): void {
   if (!videoFile || videoDuration <= 0) {
-    rangeInfo.textContent = S.rangeEmpty;
+    rangeInfo.textContent = t('trim.selectedEmpty');
     return;
   }
   const W = trimBar.clientWidth || 1;
@@ -978,7 +1061,12 @@ function updateTrimUI(): void {
   trimR.setAttribute('aria-valuenow', trimEnd.toFixed(2));
   const dur = trimEnd - trimStart;
   const frames = Math.max(1, Math.ceil(dur * Number(fpsSelect.value)));
-  rangeInfo.textContent = S.rangeSelected(fmt1(trimStart), fmt1(trimEnd), fmt1(dur), frames);
+  rangeInfo.textContent = t('trim.selected', {
+    start: fmt1(trimStart),
+    end: fmt1(trimEnd),
+    duration: fmt1(dur),
+    frames,
+  });
 }
 
 /** 设定裁剪区间（钳制到 [0, videoDuration] 且保持最短 0.1s） */
@@ -1008,24 +1096,28 @@ async function buildTrimStrip(): Promise<void> {
     await withTimeout(
       new Promise<void>((resolve, reject) => {
         stripVideo.addEventListener('loadedmetadata', () => resolve(), { once: true });
-        stripVideo.addEventListener('error', () => reject(new Error(S.stripFail)), { once: true });
+        stripVideo.addEventListener('error', () => reject(new Error(t('error.trimStripFailed'))), {
+          once: true,
+        });
       }),
       10_000,
-      () => new Error(S.stripTimeout),
+      () => new Error(t('error.trimStripTimeout')),
     );
     const tw = W / STRIP_THUMBS;
     const vw = stripVideo.videoWidth;
     const vh = stripVideo.videoHeight;
     for (let i = 0; i < STRIP_THUMBS; i++) {
-      const t = ((i + 0.5) / STRIP_THUMBS) * videoDuration;
+      const thumbT = ((i + 0.5) / STRIP_THUMBS) * videoDuration;
       await withTimeout(
         new Promise<void>((resolve, reject) => {
           stripVideo.addEventListener('seeked', () => resolve(), { once: true });
-          stripVideo.addEventListener('error', () => reject(new Error(S.stripFail)), { once: true });
-          stripVideo.currentTime = Math.min(t, Math.max(0, videoDuration - 0.001));
+          stripVideo.addEventListener('error', () => reject(new Error(t('error.trimStripFailed'))), {
+            once: true,
+          });
+          stripVideo.currentTime = Math.min(thumbT, Math.max(0, videoDuration - 0.001));
         }),
         5_000,
-        () => new Error(S.stripTimeout),
+        () => new Error(t('error.trimStripTimeout')),
       );
       // cover 适配：保持源宽高比居中裁切
       const scale = Math.max(tw / vw, H / vh);
@@ -1034,7 +1126,7 @@ async function buildTrimStrip(): Promise<void> {
       ctx.drawImage(stripVideo, i * tw + (tw - dw) / 2, (H - dh) / 2, dw, dh);
     }
   } catch (e) {
-    console.warn((e as Error).message || S.stripFail, e);
+    console.warn((e as Error).message || t('error.trimStripFailed'), e);
   } finally {
     stripVideo.removeAttribute('src');
     stripVideo.load();
@@ -1102,19 +1194,19 @@ function stopSyncPlay(): void {
   }
   sourceVideo.pause();
   resultVideo.pause();
-  setSyncLabel(S.syncPlay);
+  setSyncLabel(t('btn.syncPlay'));
 }
 
 function startSyncPlay(): void {
   if (!resultUrl || syncing) return;
   syncing = true;
-  setSyncLabel(S.stopSync);
+  setSyncLabel(t('btn.stopSync'));
   const syncTime = () => {
-    const t = Math.min(
+    const target = Math.min(
       Math.max(0, sourceVideo.currentTime - exportTrimStart),
       resultVideo.duration || 0,
     );
-    if (Math.abs(resultVideo.currentTime - t) > 0.15) resultVideo.currentTime = t;
+    if (Math.abs(resultVideo.currentTime - target) > 0.15) resultVideo.currentTime = target;
   };
   syncTime();
   void sourceVideo.play().catch(() => {});
@@ -1143,11 +1235,12 @@ type ExportSession = {
   abort(): void;
 };
 
-/** 导出卡 4 态：idle/busy/ok/warn（原站 BG 函数；取消与出错同为 warn） */
-function setExportCard(label: string, detail: string, state: string, showDownload = false): void {
+/** 导出卡 4 态：idle/busy/ok/warn（原站 BG 函数；取消与出错同为 warn）。label/detail 记 token 供语言切换重渲染 */
+function setExportCard(label: Dyn, detail: Dyn, state: string, showDownload = false): void {
+  exportDyn = { label, detail, state };
   exportCard.className = `export-card export-${state}`;
-  exportStatusLabel.textContent = label;
-  exportStatusDetail.textContent = detail;
+  exportStatusLabel.textContent = renderDyn(label);
+  exportStatusDetail.textContent = renderDyn(detail);
   downloadButton.hidden = !showDownload;
   downloadButton.disabled = !showDownload || !resultUrl;
 }
@@ -1265,7 +1358,7 @@ function createWebMSession(fps: number): ExportSession {
     ['video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'].find((m) =>
       MediaRecorder.isTypeSupported(m),
     ) || '';
-  if (!mimeType) throw new Error(S.noMediaRecorder);
+  if (!mimeType) throw new Error(t('status.noMediaRecorder'));
 
   const stream = depthCanvas.captureStream(fps);
   const recorder = new MediaRecorder(stream, { mimeType });
@@ -1321,10 +1414,15 @@ function finishExport(frames: number, fps: number, format: string, blob: Blob): 
   resultVideo.src = resultUrl;
   resultVideo.load();
 
-  setExportCard(S.exportSuccess, S.exportSuccessDetail(frames, fps, format), 'ok', true);
-  outputBadge.textContent = S.badgeDone;
-  progressTitle.textContent = S.titleDone;
-  statusLine.textContent = S.doneWithFormat(frames, fps, format);
+  setExportCard(
+    { key: 'export.success' },
+    { key: 'export.successDetail', params: { frames, fps, format } },
+    'ok',
+    true,
+  );
+  setOutputBadge({ key: 'title.done' });
+  setTitle({ key: 'badge.done' });
+  setStatus({ key: 'status.done', params: { frames, fps, format } });
   setProgress(100);
   syncPlayButton.disabled = false;
 }
@@ -1367,22 +1465,22 @@ async function startProcessing(): Promise<void> {
   cancelButton.disabled = false;
   progressTrack.classList.add('is-active');
   setProgress(0);
-  setExportCard(S.exportBusy, S.exportPrepare, 'busy');
+  setExportCard({ key: 'export.busy' }, { key: 'export.prepare' }, 'busy');
 
   let session: ExportSession | null = null;
   let sessionDone = false;
   try {
-    progressTitle.textContent = S.titlePreparing;
-    statusLine.textContent = '正在准备模型...';
+    setTitle({ key: 'title.preparing' });
+    setStatus({ key: 'status.preparing' });
     const pipe = await loadDepthModel();
-    if (cancelled) throw new Error(S.aborted);
+    if (cancelled) throw new Error(t('status.aborted'));
 
     // 仅人物：处理开始前加载分割模型（失败回退全白掩码，不阻断）
     segBroken = false;
     const personMode = personModeSelect.value === 'person';
     if (personMode) {
       await ensureSegmenter();
-      if (cancelled) throw new Error(S.aborted);
+      if (cancelled) throw new Error(t('status.aborted'));
     }
 
     const fps = Number(fpsSelect.value);
@@ -1396,7 +1494,7 @@ async function startProcessing(): Promise<void> {
     resultVideo.hidden = true;
     depthCanvas.hidden = false;
     liveFrameTag.hidden = false;
-    outputBadge.textContent = S.badgeConverting;
+    setOutputBadge({ key: 'export.busy' });
     outputMeta.textContent = `${w}×${h}`;
 
     const start = trimStart;
@@ -1407,19 +1505,25 @@ async function startProcessing(): Promise<void> {
 
     // 编码路径：优先 MP4（WebCodecs），不可用则降级 WebM（MediaRecorder）
     session = await createMp4Session(w, h, fps, total);
-    progressTitle.textContent = S.titleGenerating;
+    setTitle({ key: 'title.generating' });
     if (session) {
-      statusLine.textContent = S.startFrames(start.toFixed(1), end.toFixed(1), total);
-      setExportCard(S.exportBusy, S.exportGenerating, 'busy');
+      setStatus({
+        key: 'status.startFrames',
+        params: { start: start.toFixed(1), end: end.toFixed(1), frames: total },
+      });
+      setExportCard({ key: 'export.busy' }, { key: 'export.generating' }, 'busy');
     } else {
-      statusLine.textContent = S.fallbackWebm(start.toFixed(1), end.toFixed(1));
-      setExportCard(S.exportBusy, S.exportGenerating, 'busy');
+      setStatus({
+        key: 'status.fallbackWebm',
+        params: { start: start.toFixed(1), end: end.toFixed(1) },
+      });
+      setExportCard({ key: 'export.busy' }, { key: 'export.generating' }, 'busy');
       session = createWebMSession(fps);
     }
 
     const t0 = performance.now();
     for (let i = 0; i < total; i++) {
-      if (cancelled) throw new Error(S.aborted);
+      if (cancelled) throw new Error(t('status.aborted'));
       const tSec = Math.min(start + i / fps, Math.max(start, end - 0.001));
       await seekVideo(tSec);
       processCtx.drawImage(sourceVideo, 0, 0, w, h);
@@ -1432,37 +1536,41 @@ async function startProcessing(): Promise<void> {
       const done = i + 1;
       const instantFps = done / ((performance.now() - t0) / 1000);
       setProgress((done / total) * 100);
-      statusLine.textContent = S.processing(done, total, fps);
+      setStatus({ key: 'status.progress', params: { done, total, fps } });
       liveFrameText.textContent = `FRAME ${done} / ${total}`;
-      frameMeta.textContent = S.framesFps(done, total, instantFps.toFixed(1));
+      frameMetaDyn = {
+        key: 'export.progressDetail',
+        params: { done, total, fps: instantFps.toFixed(1) },
+      };
+      frameMeta.textContent = renderDyn(frameMetaDyn);
       speedMeta.textContent = `${instantFps.toFixed(1)} fps`;
       await nextFrame();
     }
 
     if (session.format === 'MP4') {
-      progressTitle.textContent = S.titleMuxing;
-      statusLine.textContent = S.exportMuxing;
-      setExportCard(S.exportBusy, S.exportMuxing, 'busy');
+      setTitle({ key: 'title.muxing' });
+      setStatus({ key: 'status.muxing' });
+      setExportCard({ key: 'export.busy' }, { key: 'export.muxing' }, 'busy');
     }
     const blob = await session.finalize();
     sessionDone = true;
     finishExport(total, fps, session.format, blob);
   } catch (e) {
     if (isCancelError(e)) {
-      outputBadge.textContent = S.badgeCancelled;
-      progressTitle.textContent = S.titleCancelled;
-      statusLine.textContent = S.cancelled;
-      setExportCard(S.exportCancelled, S.exportCancelledDetail, 'warn');
+      setOutputBadge({ key: 'title.cancelled' });
+      setTitle({ key: 'title.cancelled' });
+      setStatus({ key: 'status.cancelled' });
+      setExportCard({ key: 'export.cancelled' }, { key: 'export.cancelledDetail' }, 'warn');
     } else {
       console.error('处理失败', e);
-      outputBadge.textContent = S.badgeError;
-      progressTitle.textContent = S.titleError;
-      const message = (e as Error)?.message || S.unknownError;
+      setOutputBadge({ key: 'title.error' });
+      setTitle({ key: 'title.error' });
+      const message = (e as Error)?.message || t('status.unknownError');
       const hint = /failed to fetch|unexpected token|not valid json/i.test(message)
-        ? S.fetchHint
+        ? t('status.fetchHint')
         : '';
-      statusLine.textContent = S.failWithHint(message, hint);
-      setExportCard(S.exportFailed, message, 'warn');
+      setStatus({ key: 'status.failed', params: { message, hint } });
+      setExportCard({ key: 'export.failed' }, { raw: message }, 'warn');
     }
   } finally {
     if (!sessionDone) session?.abort();
@@ -1477,10 +1585,33 @@ async function startProcessing(): Promise<void> {
 function cancelProcessing(): void {
   if (!processing) return;
   cancelled = true;
-  progressTitle.textContent = S.titleCancelling;
-  statusLine.textContent = S.cancelling;
-  setExportCard(S.exportCancelling, S.exportCancellingDetail, 'warn');
+  setTitle({ key: 'title.cancelling' });
+  setStatus({ key: 'status.cancelling' });
+  setExportCard({ key: 'export.cancelling' }, { key: 'export.cancellingDetail' }, 'warn');
   cancelButton.disabled = true;
+}
+
+// ---------------------------------------------------------------------------
+// 语言切换全量重渲染（原站 HW）：静态 data-i18n* + doc meta + 按钮激活态 +
+// 动态状态 token（状态行/标题/徽标/导出卡/帧信息/选择视频钮/同步钮/裁剪信息/模型缓存）
+// ---------------------------------------------------------------------------
+function rerenderAll(): void {
+  applyI18n();
+  applyDocMeta();
+  syncLangButtons();
+  setStatus(statusDyn);
+  setTitle(titleDyn);
+  setInputBadge(inputBadgeDyn);
+  setOutputBadge(outputBadgeDyn);
+  exportCard.className = `export-card export-${exportDyn.state}`;
+  exportStatusLabel.textContent = renderDyn(exportDyn.label);
+  exportStatusDetail.textContent = renderDyn(exportDyn.detail);
+  if (frameMetaDyn) frameMeta.textContent = renderDyn(frameMetaDyn);
+  pickVideoLabel.textContent = t(videoFile ? 'btn.reselect' : 'btn.pickVideo');
+  gpuBadge.textContent = 'gpu' in navigator ? t('gpu.webgpu') : t('gpu.wasm');
+  setSyncLabel(syncing ? t('btn.stopSync') : t('btn.syncPlay'));
+  updateTrimUI();
+  void refreshModelCacheUI();
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,9 +1646,9 @@ export function initApp(): void {
   downloadButton.addEventListener('click', downloadResult);
   modelSelect.addEventListener('change', () => {
     syncNcWarning();
-    void refreshCacheHint();
+    void refreshModelCacheUI();
   });
-  deviceSelect.addEventListener('change', () => void refreshCacheHint());
+  deviceSelect.addEventListener('change', () => void refreshModelCacheUI());
 
   // 范围切「仅人物」时启用分割模型/背景下拉并预加载分割模型；切回「全图」时释放
   personModeSelect.addEventListener('change', () => {
@@ -1559,10 +1690,23 @@ export function initApp(): void {
     else startSyncPlay();
   });
 
-  gpuBadge.textContent = 'gpu' in navigator ? S.gpuOk : S.gpuWasm;
+  // 语言切换（原站：lang-btn click → MH + HW）
+  document.querySelectorAll<HTMLButtonElement>('.lang-btn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const lang = btn.dataset.lang;
+      if ((lang !== 'zh' && lang !== 'en') || lang === getLang()) return;
+      setLang(lang);
+      rerenderAll();
+    });
+  });
+
+  gpuBadge.textContent = 'gpu' in navigator ? t('gpu.webgpu') : t('gpu.wasm');
 
   syncNcWarning();
-  void cleanupCaches().then(() => refreshCacheHint());
+  // 启动：同步 <html lang> 与偏好（原站启动时 MH(AH)），按当前语言渲染全页，再清理缓存并刷新缓存提示
+  setLang(getLang());
+  rerenderAll();
+  void cleanupCaches().then(() => refreshModelCacheUI());
 
   // e2e 自测钩子（仅 dev）：直接断言掩码合成逻辑
   if (import.meta.env.DEV) {

@@ -66,6 +66,7 @@ async function runOnce(page, label, statusSamples) {
 const context = await chromium.launchPersistentContext(profile, {
   channel: 'chrome', // 使用系统已装 Chrome，免去 playwright chromium 下载
   headless: true,
+  locale: 'zh-CN', // 片6：固定中文环境（原站按 navigator.language 探测默认语言）
   args: ['--no-proxy-server', '--enable-unsafe-webgpu'],
 });
 let sampler = null;

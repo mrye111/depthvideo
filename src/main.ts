@@ -208,7 +208,7 @@ const template = `
                     <option value="onnx-community/depth-anything-v2-base-ONNX::fp16">V2 Base · ONNX · f16（~187MB）</option>
                     <option value="onnx-community/depth-anything-v2-base-ONNX::fp32">V2 Base · ONNX · f32（~371MB）</option>
                   </select>
-                  <p id="baseNcWarning" class="nc-warning" role="note" hidden>
+                  <p id="baseNcWarning" class="nc-warning" role="note" data-i18n="nc.warning" hidden>
                     ⚠ V2 Base 模型许可证为 CC-BY-NC-4.0，仅供学习研究，禁止商用。
                   </p>
                 </label>

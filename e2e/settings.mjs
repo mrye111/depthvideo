@@ -124,6 +124,7 @@ async function cancelAndWait(page) {
 const context = await chromium.launchPersistentContext(profile, {
   channel: 'chrome',
   headless: true,
+  locale: 'zh-CN', // 片6：固定中文环境（原站按 navigator.language 探测默认语言）
   acceptDownloads: true,
   args: ['--no-proxy-server', '--enable-unsafe-webgpu'],
 });
