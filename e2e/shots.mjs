@@ -1,5 +1,5 @@
 /**
- * 镜头分析页（/shots.html）e2e：上传样片 → TransNet 转场检测 → 镜头列表断言。
+ * 镜头分析页（/shots.html）e2e：上传样片 → TransNet 转场检测 → 时间轴/卡片/记忆/导出断言。
  * 样片：.recon/e2e/transitions.mp4（5 段：硬切@1s/2s/3s + 3.5-4.0s 叠化，25fps 126 帧，
  *       期望切点 ≈[24,49,74,91]，镜头=5）。缺失时按内置配方用 ffmpeg 现生成。
  * 用法：node e2e/shots.mjs   （E2E_DEVICE=wasm 强制 wasm 后端；E2E_URL 默认 http://localhost:5199）
@@ -81,6 +81,15 @@ async function scanMissingKeys(page) {
   });
 }
 
+const parseCards = (page) =>
+  page.evaluate(() =>
+    Array.from(document.querySelectorAll('#shotCards .shot-card')).map((card) => {
+      const m = /(\d+)–(\d+)帧/.exec(card.textContent);
+      const active = card.classList.contains('border-accent');
+      return { start: Number(m[1]), end: Number(m[2]), active };
+    }),
+  );
+
 ensureFixture();
 
 const context = await chromium.launchPersistentContext(profile, {
@@ -98,6 +107,7 @@ try {
   // ---- i18n：zh/en 双侧 0 缺失 ----
   await page.goto(baseURL, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#startButton', { state: 'attached', timeout: 15_000 });
+  await page.evaluate(() => localStorage.clear()); // 结果记忆置零，保证本次走真实检测
   console.log('— i18n 缺失扫描');
   check((await page.textContent('h1'))?.trim() === '镜头分析', '中文标题');
   check((await scanMissingKeys(page)).length === 0, 'ZH 无缺失 key');
@@ -145,27 +155,101 @@ try {
   console.log('  epBadge:', badge);
   check(badge.includes(device === 'wasm' ? 'wasm' : 'webgpu'), `后端徽标 ${device}`);
 
-  // 镜头行数与帧区间（边界容差 ±2）
-  const rows = await page.evaluate(() =>
-    Array.from(document.querySelectorAll('#shotRows tr')).map((tr) => {
-      const tds = tr.querySelectorAll('td');
-      const m2 = /(\d+)–(\d+)/.exec(tds[3].textContent);
-      return { start: Number(m2[1]), end: Number(m2[2]) };
-    }),
-  );
-  console.log('  rows:', JSON.stringify(rows));
-  check(rows.length === 5, '镜头行数 = 5');
-  const cuts = rows.slice(0, -1).map((r) => r.end);
+  // ---- 镜头卡片（帧区间，边界容差 ±2） ----
+  const cards = await parseCards(page);
+  console.log('  cards:', JSON.stringify(cards));
+  check(cards.length === 5, '镜头卡片数 = 5');
+  const cuts = cards.slice(0, -1).map((r) => r.end);
   const expected = [24, 49, 74, 91];
   check(
     cuts.every((c, i) => Math.abs(c - expected[i]) <= 2),
     `切点位置 ≈[24,49,74,91]（实际 ${JSON.stringify(cuts)}）`,
   );
-  check(rows[0].start === 0 && rows[4].end >= 124, '首段从 0 起、末段到片尾');
+  check(cards[0].start === 0 && cards[4].end >= 124, '首段从 0 起、末段到片尾');
+
+  // ---- 缩略图（异步填充） ----
+  await page.waitForSelector('.shot-thumb[src^="data:image"]', { timeout: 60_000 });
+  check(true, '卡片缩略图已填充');
+
+  // ---- 时间轴：点击分段选中并定位 ----
+  console.log('— 时间轴与选中联动');
+  const tlBox = await page.locator('#timelineCanvas').boundingBox();
+  if (!tlBox) throw new Error('时间轴不可见');
+  // locator.click 自动滚动到可视区（裸 mouse.click 在视口外会落空）
+  await page.locator('#timelineCanvas').click({
+    position: { x: tlBox.width * 0.492, y: tlBox.height / 2 },
+  });
+  await page.waitForFunction(
+    () => Math.abs(document.getElementById('preview').currentTime - 2.0) < 0.3,
+    null,
+    { timeout: 10_000, polling: 200 },
+  );
+  check(true, '点击时间轴第 3 段 → 预览定位 ≈2.0s');
+  let cards2 = await parseCards(page);
+  check(cards2[2].active && cards2.filter((c) => c.active).length === 1, '第 3 张卡片选中高亮');
+
+  // 点卡片定位
+  await page.locator('#shotCards .shot-card').nth(0).click();
+  await page.waitForFunction(
+    () => document.getElementById('preview').currentTime < 0.3,
+    null,
+    { timeout: 10_000, polling: 200 },
+  );
+  check(true, '点击卡片 1 → 预览定位 ≈0s');
+  cards2 = await parseCards(page);
+  check(cards2[0].active, '卡片 1 选中高亮');
+
+  // ---- JSON 导出 ----
+  console.log('— JSON 导出');
+  const [download] = await Promise.all([
+    page.waitForEvent('download', { timeout: 15_000 }),
+    page.click('#exportButton'),
+  ]);
+  check(/transitions-shots\.json$/.test(download.suggestedFilename()), '导出文件名 transitions-shots.json');
+  const exportData = JSON.parse(fs.readFileSync(await download.path(), 'utf8'));
+  check(exportData.video?.name === 'transitions.mp4', '导出 video.name');
+  check(exportData.video?.fps === 25 && exportData.video?.width === 640, '导出 video 元信息');
+  check(Array.isArray(exportData.boundaries) && exportData.boundaries.length === 4, '导出 boundaries = 4');
+  check(
+    Array.isArray(exportData.shots) && exportData.shots.length === 5 && exportData.shots[0].startSec === 0,
+    '导出 shots = 5 且首段 0 起',
+  );
+  check(
+    typeof exportData.boundaries[0].prob === 'number' && exportData.boundaries[0].prob > 0.5,
+    '导出边界含置信度',
+  );
+  check(String(exportData.meta?.transnetModel || '').includes('TransNet'), '导出 meta.transnetModel');
+  check(!('motion' in exportData.shots[0]), '未接入运镜时无 motion 字段');
+
+  // ---- 结果记忆：重载后同文件免重检 ----
+  console.log('— 结果记忆');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.setInputFiles('#fileInput', fixture);
+  await page.waitForFunction(
+    () => (document.getElementById('statusLine').textContent || '').includes('已从本地恢复'),
+    null,
+    { timeout: 30_000, polling: 300 },
+  );
+  check(true, '恢复提示出现（免重检）');
+  const cards3 = await parseCards(page);
+  check(cards3.length === 5, '恢复后卡片数 = 5');
+  check(await page.evaluate(() => !document.getElementById('exportButton').disabled), '恢复后导出可用');
+  check(await page.evaluate(() => !document.getElementById('startButton').disabled), '恢复后可重新检测');
+  const stored = await page.evaluate(() =>
+    Object.keys(localStorage).filter((k) => k.startsWith('shots.result.v1.')),
+  );
+  check(stored.length === 1, 'localStorage 记忆键存在');
 
   // ---- 取消路径（wasm 慢速下点取消；webgpu 过快则跳过） ----
   if (device === 'wasm') {
     console.log('— 取消路径');
+    await page.evaluate(() => localStorage.clear()); // 强制走真实检测
+    await page.setInputFiles('#fileInput', fixture);
+    await page.waitForFunction(
+      () => (document.getElementById('metaFps').textContent || '').trim() !== '…',
+      null,
+      { timeout: 30_000, polling: 300 },
+    );
     await page.click('#startButton');
     await page.waitForFunction(
       () => /抽帧|推理窗口|加载检测模型/.test(document.getElementById('statusLine').textContent || ''),
@@ -179,7 +263,6 @@ try {
       { timeout: 30_000, polling: 300 },
     );
     check(await page.evaluate(() => !document.getElementById('startButton').disabled), '取消后开始按钮恢复可用');
-    // 取消后重跑应成功
     await page.click('#startButton');
     await page.waitForFunction(
       () => /检测完成/.test(document.getElementById('statusLine').textContent || ''),
@@ -191,7 +274,7 @@ try {
     console.log('— 取消路径（跳过：webgpu 检测过快，wasm 模式覆盖）');
   }
 
-  console.log(`\nPASS: 镜头分析页（i18n/上传/检测/列表${device === 'wasm' ? '/取消重跑' : ''}）全部通过`);
+  console.log(`\nPASS: 镜头分析页（i18n/上传/检测/卡片/时间轴/导出/记忆${device === 'wasm' ? '/取消重跑' : ''}）全部通过`);
 } finally {
   await context.close();
 }
