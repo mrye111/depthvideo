@@ -10,7 +10,12 @@
  * avc:{format:'avc'}，关键帧每 2s，encodeQueueSize>8 flush 背压）+ mp4-muxer ArrayBufferTarget；
  * 无 VideoEncoder/VideoFrame 或 avc1 全不支持时降级 captureStream(fps)+MediaRecorder（vp9→vp8→webm，
  * start(1000)，帧间 sleep(1000/fps) 按墙钟喂帧）；导出卡 idle/busy/ok/warn 4 态与文案照原站。
- * 样式/平滑/仅人物、胶片条裁剪 UI 在后续片实现；本片裁剪仅维护入点/出点状态（默认全片）。
+ * 片4：设置项补齐。行为照 research/video-export-pipeline.md §4 与 ui-ux-inventory.md §2.4 复刻：
+ * 样式（灰度/热力——选项名 turbo 但数学是 Jet 三角近似 255·clamp(1.5−|4x−{3,2,1}|)，非真 turbo LUT）、
+ * 深度方向（near-white 原值 / far-white 255−v）、时域平滑（out=prev·k+cur·(1−k)，k 0–0.85 默认 0.35，
+ * 作用于 colormap 前的标量，换参数/重跑时重置上一帧状态）逐帧实时读取，改动下一帧即生效；
+ * 分辨率/帧率在每次处理开始时读取，导出规格跟随；胶片条裁剪手柄（拖拽/键盘/重置，最短 0.1s）
+ * 真实作用于帧范围与导出时长；同步播放对照源/结果视频。仅人物/分割模型在片5 接。
  */
 import { pipeline, env, RawImage } from '@huggingface/transformers';
 import type { DepthEstimationPipeline, DepthEstimationOutput } from '@huggingface/transformers';
@@ -124,6 +129,21 @@ let modelSelect: HTMLSelectElement;
 let deviceSelect: HTMLSelectElement;
 let sizeSelect: HTMLSelectElement;
 let fpsSelect: HTMLSelectElement;
+let styleSelect: HTMLSelectElement;
+let directionSelect: HTMLSelectElement;
+let smoothRange: HTMLInputElement;
+let smoothValue: HTMLOutputElement;
+let syncPlayButton: HTMLButtonElement;
+let trimWrap: HTMLDivElement;
+let trimBar: HTMLDivElement;
+let trimStrip: HTMLCanvasElement;
+let shadeL: HTMLDivElement;
+let shadeR: HTMLDivElement;
+let trimRegion: HTMLDivElement;
+let trimL: HTMLDivElement;
+let trimR: HTMLDivElement;
+let rangeInfo: HTMLSpanElement;
+let rangeResetBtn: HTMLButtonElement;
 let modelCacheHint: HTMLSpanElement;
 let startButton: HTMLButtonElement;
 let cancelButton: HTMLButtonElement;
@@ -160,6 +180,21 @@ function bindRefs(): void {
   deviceSelect = $<HTMLSelectElement>('deviceSelect');
   sizeSelect = $<HTMLSelectElement>('sizeSelect');
   fpsSelect = $<HTMLSelectElement>('fpsSelect');
+  styleSelect = $<HTMLSelectElement>('styleSelect');
+  directionSelect = $<HTMLSelectElement>('directionSelect');
+  smoothRange = $<HTMLInputElement>('smoothRange');
+  smoothValue = $<HTMLOutputElement>('smoothValue');
+  syncPlayButton = $<HTMLButtonElement>('syncPlayButton');
+  trimWrap = $<HTMLDivElement>('trimWrap');
+  trimBar = $<HTMLDivElement>('trimBar');
+  trimStrip = $<HTMLCanvasElement>('trimStrip');
+  shadeL = $<HTMLDivElement>('shadeL');
+  shadeR = $<HTMLDivElement>('shadeR');
+  trimRegion = $<HTMLDivElement>('trimRegion');
+  trimL = $<HTMLDivElement>('trimL');
+  trimR = $<HTMLDivElement>('trimR');
+  rangeInfo = $<HTMLSpanElement>('rangeInfo');
+  rangeResetBtn = $<HTMLButtonElement>('rangeResetBtn');
   modelCacheHint = $<HTMLSpanElement>('modelCacheHint');
   startButton = $<HTMLButtonElement>('startButton');
   cancelButton = $<HTMLButtonElement>('cancelButton');
@@ -242,6 +277,13 @@ const S = {
   gpuWasm: '硬件加速：WASM 模式',
   cacheYes: '✓ 已缓存',
   cacheNo: '尚未缓存',
+  rangeSelected: (start: string, end: string, duration: string, frames: number) =>
+    `已选：${start}s – ${end}s（${duration}秒 ≈ ${frames}帧）`,
+  rangeEmpty: '已选：—',
+  stripFail: '胶片条加载失败',
+  stripTimeout: '胶片条加载超时',
+  syncPlay: '同步播放',
+  stopSync: '停止同步',
 };
 
 // ---------------------------------------------------------------------------
@@ -281,9 +323,11 @@ function modelVariants(id: string): string[] {
 let videoFile: File | null = null;
 let videoUrl: string | null = null;
 let videoDuration = 0;
-/** 裁剪入点/出点（秒）。本片裁剪 UI 不接，默认全片；帧循环读取该状态。 */
+/** 裁剪入点/出点（秒）。胶片条手柄实时改写，帧循环与导出时长读取该状态。 */
 let trimStart = 0;
 let trimEnd = 0;
+/** 本次导出实际使用的入点（同步播放时把源时间轴映射到结果时间轴） */
+let exportTrimStart = 0;
 let depthPipe: DepthEstimationPipeline | null = null;
 let depthPipeKey = '';
 let cancelled = false;
@@ -291,6 +335,11 @@ let processing = false;
 /** 最近一次完成导出的产物（供下载按钮使用） */
 let resultUrl: string | null = null;
 let resultName = '';
+/** 时域平滑的上一帧标量（深度 tensor 分辨率，每像素一个 0-255 值）；重跑/换参数时重置 */
+let prevSmooth: Uint8ClampedArray | null = null;
+/** 同步播放状态 */
+let syncing = false;
+let syncTimer: ReturnType<typeof setInterval> | null = null;
 
 const processCanvas = document.createElement('canvas');
 const processCtx = processCanvas.getContext('2d', { willReadFrequently: true })!;
@@ -432,6 +481,11 @@ async function loadVideo(file: File): Promise<void> {
   progressTitle.textContent = '等待中';
   statusLine.textContent = S.videoReady;
   startButton.disabled = false;
+  stopSyncPlay();
+  syncPlayButton.disabled = true;
+  trimWrap.hidden = false;
+  updateTrimUI();
+  void buildTrimStrip();
 }
 
 // ---------------------------------------------------------------------------
@@ -544,11 +598,65 @@ async function loadDepthModel(): Promise<DepthEstimationPipeline> {
 }
 
 // ---------------------------------------------------------------------------
-// 灰度深度图渲染（本片仅默认灰度；样式/方向/平滑在片4 接）
+// 深度图渲染：方向反转 → 时域平滑（colormap 前的标量）→ 灰度/Jet 着色
+// （research/video-export-pipeline.md §4，原站 mG/hG 函数）
 // ---------------------------------------------------------------------------
-function renderDepthGray(depth: RawImage): void {
+const mapCanvas = document.createElement('canvas');
+const mapCtx = mapCanvas.getContext('2d', { willReadFrequently: true })!;
+
+/** Jet 三角近似（原站选项名叫 turbo，但数学是经典 Jet，严禁换成真 turbo LUT） */
+function jet(x: number): [number, number, number] {
+  const c = (a: number) => Math.round(255 * Math.max(0, Math.min(1, 1.5 - Math.abs(4 * x - a))));
+  return [c(3), c(2), c(1)];
+}
+
+/** 重置时域平滑状态（重新开始导出 / 换方向 / 换平滑系数 / 深度尺寸变化时调用） */
+function resetSmoothState(): void {
+  prevSmooth = null;
+}
+
+function renderDepth(depth: RawImage): void {
   const src = depth.toCanvas() as HTMLCanvasElement;
-  depthCtx.drawImage(src, 0, 0, depthCanvas.width, depthCanvas.height);
+  const sw = src.width;
+  const sh = src.height;
+  if (mapCanvas.width !== sw || mapCanvas.height !== sh) {
+    mapCanvas.width = sw;
+    mapCanvas.height = sh;
+    prevSmooth = null;
+  }
+  mapCtx.drawImage(src, 0, 0);
+  const img = mapCtx.getImageData(0, 0, sw, sh);
+  const d = img.data;
+  const pixels = d.length / 4;
+
+  // 逐帧实时读取样式设置，处理中改动下一帧即生效
+  const invert = directionSelect.value === 'far-white';
+  const turbo = styleSelect.value === 'turbo';
+  const k = Math.min(0.85, Math.max(0, Number(smoothRange.value) || 0));
+
+  const primed = prevSmooth !== null && prevSmooth.length === pixels;
+  if (!primed) prevSmooth = new Uint8ClampedArray(pixels);
+  const prev = prevSmooth as Uint8ClampedArray;
+
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    let v = invert ? 255 - d[i] : d[i];
+    // 一阶 IIR：out = prev*k + cur*(1-k)，与上一帧输出做指数平均；首帧无平滑
+    if (primed && k > 0) v = Math.round(prev[p] * k + v * (1 - k));
+    prev[p] = v;
+    if (turbo) {
+      const [r, g, b] = jet(v / 255);
+      d[i] = r;
+      d[i + 1] = g;
+      d[i + 2] = b;
+    } else {
+      d[i] = v;
+      d[i + 1] = v;
+      d[i + 2] = v;
+    }
+    d[i + 3] = 255;
+  }
+  mapCtx.putImageData(img, 0, 0);
+  depthCtx.drawImage(mapCanvas, 0, 0, depthCanvas.width, depthCanvas.height);
 }
 
 /** 处理画布尺寸：长边缩到设定值、保宽高比、两维向下取偶 */
@@ -567,6 +675,193 @@ function computeOutputSize(): { w: number; h: number } {
   w -= w % 2;
   h -= h % 2;
   return { w: Math.max(2, w), h: Math.max(2, h) };
+}
+
+// ---------------------------------------------------------------------------
+// 胶片条裁剪条：缩略图条 + 左右手柄拖拽/键盘 + 整段拖动 + 重置（最短 0.1s）
+// 状态 trimStart/trimEnd 被帧循环与导出时长直接读取，改动即生效于下次处理。
+// ---------------------------------------------------------------------------
+const MIN_CLIP = 0.1;
+const STRIP_THUMBS = 12;
+
+function fmt1(v: number): string {
+  return v.toFixed(1);
+}
+
+/** 按当前 trimStart/trimEnd 刷新遮罩/选区/手柄位置与「已选」文案 */
+function updateTrimUI(): void {
+  if (!videoFile || videoDuration <= 0) {
+    rangeInfo.textContent = S.rangeEmpty;
+    return;
+  }
+  const W = trimBar.clientWidth || 1;
+  const x1 = (trimStart / videoDuration) * W;
+  const x2 = (trimEnd / videoDuration) * W;
+  shadeL.style.left = '0px';
+  shadeL.style.width = `${x1}px`;
+  shadeR.style.left = `${x2}px`;
+  shadeR.style.width = `${Math.max(0, W - x2)}px`;
+  trimRegion.style.left = `${x1}px`;
+  trimRegion.style.width = `${Math.max(0, x2 - x1)}px`;
+  trimL.style.left = `${Math.max(0, x1 - 7)}px`;
+  trimR.style.left = `${Math.min(Math.max(0, W - 14), x2 - 7)}px`;
+  trimL.setAttribute('aria-valuemin', '0');
+  trimL.setAttribute('aria-valuemax', videoDuration.toFixed(2));
+  trimL.setAttribute('aria-valuenow', trimStart.toFixed(2));
+  trimR.setAttribute('aria-valuemin', '0');
+  trimR.setAttribute('aria-valuemax', videoDuration.toFixed(2));
+  trimR.setAttribute('aria-valuenow', trimEnd.toFixed(2));
+  const dur = trimEnd - trimStart;
+  const frames = Math.max(1, Math.ceil(dur * Number(fpsSelect.value)));
+  rangeInfo.textContent = S.rangeSelected(fmt1(trimStart), fmt1(trimEnd), fmt1(dur), frames);
+}
+
+/** 设定裁剪区间（钳制到 [0, videoDuration] 且保持最短 0.1s） */
+function setTrim(start: number, end: number): void {
+  start = Math.min(Math.max(0, start), videoDuration - MIN_CLIP);
+  end = Math.min(Math.max(start + MIN_CLIP, end), videoDuration);
+  trimStart = start;
+  trimEnd = end;
+  updateTrimUI();
+}
+
+/** 生成胶片条缩略图：独立 video 元素均匀取 12 帧画入 trimStrip，不干扰源视频播放位置 */
+async function buildTrimStrip(): Promise<void> {
+  const W = Math.max(1, trimBar.clientWidth);
+  const H = 48;
+  trimStrip.width = W;
+  trimStrip.height = H;
+  const ctx = trimStrip.getContext('2d', { willReadFrequently: true })!;
+  ctx.clearRect(0, 0, W, H);
+  if (!videoUrl || videoDuration <= 0) return;
+
+  const stripVideo = document.createElement('video');
+  stripVideo.muted = true;
+  stripVideo.preload = 'auto';
+  stripVideo.src = videoUrl;
+  try {
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        stripVideo.addEventListener('loadedmetadata', () => resolve(), { once: true });
+        stripVideo.addEventListener('error', () => reject(new Error(S.stripFail)), { once: true });
+      }),
+      10_000,
+      () => new Error(S.stripTimeout),
+    );
+    const tw = W / STRIP_THUMBS;
+    const vw = stripVideo.videoWidth;
+    const vh = stripVideo.videoHeight;
+    for (let i = 0; i < STRIP_THUMBS; i++) {
+      const t = ((i + 0.5) / STRIP_THUMBS) * videoDuration;
+      await withTimeout(
+        new Promise<void>((resolve, reject) => {
+          stripVideo.addEventListener('seeked', () => resolve(), { once: true });
+          stripVideo.addEventListener('error', () => reject(new Error(S.stripFail)), { once: true });
+          stripVideo.currentTime = Math.min(t, Math.max(0, videoDuration - 0.001));
+        }),
+        5_000,
+        () => new Error(S.stripTimeout),
+      );
+      // cover 适配：保持源宽高比居中裁切
+      const scale = Math.max(tw / vw, H / vh);
+      const dw = vw * scale;
+      const dh = vh * scale;
+      ctx.drawImage(stripVideo, i * tw + (tw - dw) / 2, (H - dh) / 2, dw, dh);
+    }
+  } catch (e) {
+    console.warn((e as Error).message || S.stripFail, e);
+  } finally {
+    stripVideo.removeAttribute('src');
+    stripVideo.load();
+  }
+}
+
+/** 手柄/选区拖拽（Pointer Events，处理中禁用） */
+function bindTrimDrag(el: HTMLElement, which: 'L' | 'R' | 'region'): void {
+  el.addEventListener('pointerdown', (e) => {
+    if (processing || !videoFile || videoDuration <= 0) return;
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    if (which === 'region') trimRegion.classList.add('is-dragging');
+    const startX = e.clientX;
+    const s0 = trimStart;
+    const e0 = trimEnd;
+    const onMove = (ev: PointerEvent) => {
+      const dt = ((ev.clientX - startX) / (trimBar.clientWidth || 1)) * videoDuration;
+      if (which === 'L') {
+        setTrim(s0 + dt, e0);
+      } else if (which === 'R') {
+        setTrim(s0, e0 + dt);
+      } else {
+        const dur = e0 - s0;
+        const ns = Math.min(Math.max(0, s0 + dt), videoDuration - dur);
+        setTrim(ns, ns + dur);
+      }
+    };
+    const onUp = () => {
+      trimRegion.classList.remove('is-dragging');
+      el.removeEventListener('pointermove', onMove);
+    };
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp, { once: true });
+    el.addEventListener('pointercancel', onUp, { once: true });
+  });
+}
+
+/** 手柄键盘操作（role=slider）：←/→ ±0.1s，Shift ±1s */
+function bindTrimKeys(el: HTMLElement, which: 'L' | 'R'): void {
+  el.addEventListener('keydown', (e) => {
+    if (processing || !videoFile) return;
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const step = (e.shiftKey ? 1 : 0.1) * (e.key === 'ArrowRight' ? 1 : -1);
+    if (which === 'L') setTrim(trimStart + step, trimEnd);
+    else setTrim(trimStart, trimEnd + step);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 同步播放：源视频与结果视频对照播放（结果时间轴 = 源时间轴 − 导出时入点）
+// ---------------------------------------------------------------------------
+function setSyncLabel(text: string): void {
+  const span = syncPlayButton.querySelector('span');
+  if (span) span.textContent = text;
+}
+
+function stopSyncPlay(): void {
+  if (!syncing) return;
+  syncing = false;
+  if (syncTimer !== null) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+  }
+  sourceVideo.pause();
+  resultVideo.pause();
+  setSyncLabel(S.syncPlay);
+}
+
+function startSyncPlay(): void {
+  if (!resultUrl || syncing) return;
+  syncing = true;
+  setSyncLabel(S.stopSync);
+  const syncTime = () => {
+    const t = Math.min(
+      Math.max(0, sourceVideo.currentTime - exportTrimStart),
+      resultVideo.duration || 0,
+    );
+    if (Math.abs(resultVideo.currentTime - t) > 0.15) resultVideo.currentTime = t;
+  };
+  syncTime();
+  void sourceVideo.play().catch(() => {});
+  void resultVideo.play().catch(() => {});
+  syncTimer = setInterval(() => {
+    syncTime();
+    if (sourceVideo.paused && !resultVideo.paused) resultVideo.pause();
+    if (!sourceVideo.paused && resultVideo.paused && !resultVideo.ended) {
+      void resultVideo.play().catch(() => {});
+    }
+    if (sourceVideo.ended) stopSyncPlay();
+  }, 250);
 }
 
 // ---------------------------------------------------------------------------
@@ -766,6 +1061,7 @@ function finishExport(frames: number, fps: number, format: string, blob: Blob): 
   progressTitle.textContent = S.titleDone;
   statusLine.textContent = S.doneWithFormat(frames, fps, format);
   setProgress(100);
+  syncPlayButton.disabled = false;
 }
 
 function downloadResult(): void {
@@ -785,6 +1081,8 @@ function clearResult(): void {
     resultUrl = null;
   }
   resultName = '';
+  stopSyncPlay();
+  syncPlayButton.disabled = true;
   resultVideo.hidden = true;
   resultVideo.removeAttribute('src');
   resultVideo.load();
@@ -797,6 +1095,9 @@ async function startProcessing(): Promise<void> {
   if (!videoFile || processing) return;
   processing = true;
   cancelled = false;
+  resetSmoothState();
+  stopSyncPlay();
+  trimBar.classList.add('is-disabled');
   startButton.disabled = true;
   cancelButton.disabled = false;
   progressTrack.classList.add('is-active');
@@ -827,6 +1128,7 @@ async function startProcessing(): Promise<void> {
 
     const start = trimStart;
     const end = Math.min(Math.max(trimStart + 0.1, trimEnd), videoDuration);
+    exportTrimStart = start;
     const clipDuration = end - start;
     const total = Math.max(1, Math.ceil(clipDuration * fps));
 
@@ -849,7 +1151,7 @@ async function startProcessing(): Promise<void> {
       await seekVideo(tSec);
       processCtx.drawImage(sourceVideo, 0, 0, w, h);
       const output = (await pipe(RawImage.fromCanvas(processCanvas))) as DepthEstimationOutput;
-      renderDepthGray(output.depth);
+      renderDepth(output.depth);
       await session.encodeFrame(i);
 
       const done = i + 1;
@@ -892,6 +1194,7 @@ async function startProcessing(): Promise<void> {
     processing = false;
     startButton.disabled = !videoFile;
     cancelButton.disabled = true;
+    trimBar.classList.remove('is-disabled');
     progressTrack.classList.remove('is-active');
   }
 }
@@ -937,6 +1240,32 @@ export function initApp(): void {
   downloadButton.addEventListener('click', downloadResult);
   modelSelect.addEventListener('change', () => void refreshCacheHint());
   deviceSelect.addEventListener('change', () => void refreshCacheHint());
+
+  // 深度图样式：平滑滑杆实时显示数值；换方向/平滑系数时重置平滑状态（原站行为）
+  smoothRange.addEventListener('input', () => {
+    smoothValue.textContent = Number(smoothRange.value).toFixed(2);
+    resetSmoothState();
+  });
+  directionSelect.addEventListener('change', resetSmoothState);
+  // 帧率影响「已选」文案中的 ≈帧数
+  fpsSelect.addEventListener('change', updateTrimUI);
+
+  // 胶片条裁剪：手柄拖拽/键盘 + 选区整段拖动 + 重置
+  bindTrimDrag(trimL, 'L');
+  bindTrimDrag(trimR, 'R');
+  bindTrimDrag(trimRegion, 'region');
+  bindTrimKeys(trimL, 'L');
+  bindTrimKeys(trimR, 'R');
+  rangeResetBtn.addEventListener('click', () => {
+    if (processing || !videoFile) return;
+    setTrim(0, videoDuration);
+  });
+
+  // 同步播放开关
+  syncPlayButton.addEventListener('click', () => {
+    if (syncing) stopSyncPlay();
+    else startSyncPlay();
+  });
 
   gpuBadge.textContent = 'gpu' in navigator ? S.gpuOk : S.gpuWasm;
 
