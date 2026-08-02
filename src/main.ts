@@ -11,6 +11,7 @@ import { initApp } from './app';
  * 仅两处 intentional 偏差：
  *   1. header 移除「海趣社」「Twitter」两条外链；
  *   2. 设置栏移除「模型下载源」（hubSelect）设置项。
+ * 片5 追加：深度模型下拉里加 #baseNcWarning（base=CC-BY-NC 非商用警示，#7 硬性要求）。
  * 交互逻辑在后续片实现。
  */
 const template = `
@@ -207,6 +208,9 @@ const template = `
                     <option value="onnx-community/depth-anything-v2-base-ONNX::fp16">V2 Base · ONNX · f16（~187MB）</option>
                     <option value="onnx-community/depth-anything-v2-base-ONNX::fp32">V2 Base · ONNX · f32（~371MB）</option>
                   </select>
+                  <p id="baseNcWarning" class="nc-warning" role="note" hidden>
+                    ⚠ V2 Base 模型许可证为 CC-BY-NC-4.0，仅供学习研究，禁止商用。
+                  </p>
                 </label>
                 <label>
                   <span class="field-label" data-i18n="field.backend">运行后端</span>

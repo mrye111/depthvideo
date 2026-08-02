@@ -154,6 +154,7 @@
   .export-warn{background:#e8a8381a;border-color:#e8a83859}
   .export-warn .export-dot{background:#e8a838;box-shadow:0 0 0 3px #e8a8382e}
   .export-warn .export-label{color:#c48a20}
+  .nc-warning{margin-top:.3rem;font-size:.68rem;line-height:1.4;color:#c48a20}
   .panel-footer{flex-shrink:0;align-items:center;min-height:2.5rem;margin-top:clamp(.4rem,1vh,.75rem);display:flex}
   .panel-footer-input{gap:.65rem}
   .panel-footer-input .meta-strip{flex:1;min-width:0}

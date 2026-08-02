@@ -15,10 +15,21 @@
  * 深度方向（near-white 原值 / far-white 255−v）、时域平滑（out=prev·k+cur·(1−k)，k 0–0.85 默认 0.35，
  * 作用于 colormap 前的标量，换参数/重跑时重置上一帧状态）逐帧实时读取，改动下一帧即生效；
  * 分辨率/帧率在每次处理开始时读取，导出规格跟随；胶片条裁剪手柄（拖拽/键盘/重置，最短 0.1s）
- * 真实作用于帧范围与导出时长；同步播放对照源/结果视频。仅人物/分割模型在片5 接。
+ * 真实作用于帧范围与导出时长；同步播放对照源/结果视频。
+ * 片5：仅人物分割与 base 模型选项。行为照 research/video-export-pipeline.md §5 1:1 复刻：
+ * tasks-vision 0.10.35 ImageSegmenter，VIDEO 模式 + confidenceMasks，wasm 固定 npmmirror，
+ * tflite 自托管 /mediapipe/selfie_segmenter[_landscape].tflite；GPU delegate 120s 超时降级 CPU 180s；
+ * person 通道（labels 正则，缺省 masks[1]，再缺省 masks[0]）float32→0-255 灰度，alpha>128 硬阈值合成，
+ * 背景按 personBgSelect 涂黑/保留原图；加载或单帧分割失败回退全白掩码（=全图），不中断处理；
+ * 分割与深度推理在同一帧循环内串行 await（先深度后分割）。base 选项旁显示 CC-BY-NC 非商用警示。
  */
 import { pipeline, env, RawImage } from '@huggingface/transformers';
-import type { DepthEstimationPipeline, DepthEstimationOutput } from '@huggingface/transformers';
+import type {
+  DepthEstimationPipeline,
+  DepthEstimationOutput,
+  BackgroundRemovalPipeline,
+} from '@huggingface/transformers';
+import { FilesetResolver, ImageSegmenter } from '@mediapipe/tasks-vision';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 
 // ---------------------------------------------------------------------------
@@ -127,12 +138,16 @@ let exportStatusDetail: HTMLElement;
 let downloadButton: HTMLButtonElement;
 let modelSelect: HTMLSelectElement;
 let deviceSelect: HTMLSelectElement;
+let baseNcWarning: HTMLParagraphElement;
 let sizeSelect: HTMLSelectElement;
 let fpsSelect: HTMLSelectElement;
 let styleSelect: HTMLSelectElement;
 let directionSelect: HTMLSelectElement;
 let smoothRange: HTMLInputElement;
 let smoothValue: HTMLOutputElement;
+let personModeSelect: HTMLSelectElement;
+let segModelSelect: HTMLSelectElement;
+let personBgSelect: HTMLSelectElement;
 let syncPlayButton: HTMLButtonElement;
 let trimWrap: HTMLDivElement;
 let trimBar: HTMLDivElement;
@@ -178,12 +193,16 @@ function bindRefs(): void {
   downloadButton = $<HTMLButtonElement>('downloadButton');
   modelSelect = $<HTMLSelectElement>('modelSelect');
   deviceSelect = $<HTMLSelectElement>('deviceSelect');
+  baseNcWarning = $<HTMLParagraphElement>('baseNcWarning');
   sizeSelect = $<HTMLSelectElement>('sizeSelect');
   fpsSelect = $<HTMLSelectElement>('fpsSelect');
   styleSelect = $<HTMLSelectElement>('styleSelect');
   directionSelect = $<HTMLSelectElement>('directionSelect');
   smoothRange = $<HTMLInputElement>('smoothRange');
   smoothValue = $<HTMLOutputElement>('smoothValue');
+  personModeSelect = $<HTMLSelectElement>('personModeSelect');
+  segModelSelect = $<HTMLSelectElement>('segModelSelect');
+  personBgSelect = $<HTMLSelectElement>('personBgSelect');
   syncPlayButton = $<HTMLButtonElement>('syncPlayButton');
   trimWrap = $<HTMLDivElement>('trimWrap');
   trimBar = $<HTMLDivElement>('trimBar');
@@ -284,6 +303,16 @@ const S = {
   stripTimeout: '胶片条加载超时',
   syncPlay: '同步播放',
   stopSync: '停止同步',
+  segPrepare: '正在准备人物分割模型...',
+  segLoadingMp: (label: string) => `仅人物：正在加载 MediaPipe ${label}（官方）...`,
+  segLoadingTf: '仅人物：正在加载 Transformers ONNX 人像分割...',
+  segInitMp: (sec: number) => `正在初始化 MediaPipe 分割模型（已用 ${sec}s）...`,
+  segDownloading: (pct: number, sec: number) => `正在下载分割模型（${pct}% · 已用 ${sec}s）...`,
+  mpWasmTimeout: 'MediaPipe WASM 加载超时。请检查网络后重试。',
+  mpGpuTimeout: 'MediaPipe 分割模型初始化超时（GPU）。',
+  mpCpuTimeout: 'MediaPipe 分割模型初始化超时（CPU）。',
+  mpGpuFallback: 'MediaPipe GPU 不可用，改用 CPU...',
+  segFallback: '人物分割不可用，已回退为全图处理。',
 };
 
 // ---------------------------------------------------------------------------
@@ -409,6 +438,11 @@ async function refreshCacheHint(): Promise<void> {
   modelCacheHint.textContent = '';
   const cached = await probeCached(spec, spec.id);
   modelCacheHint.textContent = cached ? S.cacheYes : S.cacheNo;
+}
+
+/** base 档位为 CC-BY-NC-4.0（非商用），选中时显示警示（#7 硬性要求） */
+function syncNcWarning(): void {
+  baseNcWarning.hidden = !modelSelect.value.includes('-base');
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +632,236 @@ async function loadDepthModel(): Promise<DepthEstimationPipeline> {
 }
 
 // ---------------------------------------------------------------------------
+// 仅人物分割（research/video-export-pipeline.md §5）
+// MediaPipe ImageSegmenter（VIDEO + confidenceMasks）或 transformers background-removal；
+// 任何加载/单帧失败回退全白掩码（=全图效果），不中断处理。
+// ---------------------------------------------------------------------------
+/** wasm 运行时固定走 npmmirror（原站国内源分支；本站 hub 固定 ModelScope） */
+const MP_WASM_URL =
+  'https://cdn.npmmirror.com/packages/@mediapipe/tasks-vision/0.10.35/files/wasm';
+/** tflite 权重自托管，与下载源无关 */
+const MP_TFLITE_PATHS: Record<string, string> = {
+  mediapipe: '/mediapipe/selfie_segmenter.tflite',
+  'mediapipe-landscape': '/mediapipe/selfie_segmenter_landscape.tflite',
+};
+const TF_SEG_MODEL = 'onnx-community/mediapipe_selfie_segmentation';
+
+/** 人物掩码：0-255 灰度，>128 视为人物 */
+type PersonMask = { data: Uint8ClampedArray; width: number; height: number };
+
+let mpSegmenter: ImageSegmenter | null = null;
+let mpSegmenterKey = '';
+let tfSegPipe: BackgroundRemovalPipeline | null = null;
+let tfSegPipeKey = '';
+/** 分割整体不可用（加载失败）：本帧起回退全白掩码 */
+let segBroken = false;
+
+function whiteMask(w: number, h: number): PersonMask {
+  return { data: new Uint8ClampedArray(w * h).fill(255), width: w, height: h };
+}
+
+function closeSegmenter(): void {
+  if (mpSegmenter) {
+    try {
+      mpSegmenter.close();
+    } catch {
+      /* 已关闭 */
+    }
+  }
+  mpSegmenter = null;
+  mpSegmenterKey = '';
+  (tfSegPipe as unknown as { dispose?: () => Promise<void> } | null)?.dispose?.().catch(() => {});
+  tfSegPipe = null;
+  tfSegPipeKey = '';
+}
+
+/** 加载 MediaPipe 分割：wasm 60s / GPU 120s 超时，GPU 失败降级 CPU（180s）；失败返回 null（=回退全图） */
+async function loadMpSegmenter(kind: string): Promise<ImageSegmenter | null> {
+  const tflite = MP_TFLITE_PATHS[kind] ?? MP_TFLITE_PATHS.mediapipe;
+  const key = `mp:${kind}`;
+  if (mpSegmenter && mpSegmenterKey === key) return mpSegmenter;
+  closeSegmenter();
+
+  const label = kind === 'mediapipe-landscape' ? 'Landscape' : 'Selfie';
+  statusLine.textContent = S.segLoadingMp(label);
+  const t0 = performance.now();
+  const tick = setInterval(() => {
+    if (cancelled) return;
+    statusLine.textContent = S.segInitMp(Math.round((performance.now() - t0) / 1000));
+  }, 1000);
+  try {
+    const vision = await withTimeout(
+      FilesetResolver.forVisionTasks(MP_WASM_URL),
+      60_000,
+      () => new Error(S.mpWasmTimeout),
+    );
+    const options = (delegate: 'GPU' | 'CPU') => ({
+      baseOptions: { modelAssetPath: tflite, delegate },
+      runningMode: 'VIDEO' as const,
+      outputCategoryMask: false,
+      outputConfidenceMasks: true,
+    });
+    try {
+      mpSegmenter = await withTimeout(
+        ImageSegmenter.createFromOptions(vision, options('GPU')),
+        120_000,
+        () => new Error(S.mpGpuTimeout),
+      );
+    } catch (e) {
+      console.warn(`${S.mpGpuFallback}`, e);
+      statusLine.textContent = S.mpGpuFallback;
+      mpSegmenter = await withTimeout(
+        ImageSegmenter.createFromOptions(vision, options('CPU')),
+        180_000,
+        () => new Error(S.mpCpuTimeout),
+      );
+    }
+    mpSegmenterKey = key;
+    return mpSegmenter;
+  } catch (e) {
+    console.warn('MediaPipe 分割模型加载失败，回退全图处理', e);
+    segBroken = true;
+    return null;
+  } finally {
+    clearInterval(tick);
+  }
+}
+
+/** 加载 transformers 分割（background-removal，fp32，跟随深度模型的 device）；失败返回 null */
+async function loadTfSegmenter(): Promise<BackgroundRemovalPipeline | null> {
+  const device = deviceSelect.value;
+  const key = `tf:${device}`;
+  if (tfSegPipe && tfSegPipeKey === key) return tfSegPipe;
+  closeSegmenter();
+  statusLine.textContent = S.segLoadingTf;
+  const t0 = performance.now();
+  try {
+    tfSegPipe = (await pipeline('background-removal', TF_SEG_MODEL, {
+      device: device as 'webgpu' | 'wasm',
+      dtype: 'fp32',
+      progress_callback: (info: { status: string; loaded?: number; total?: number }) => {
+        if (cancelled) return;
+        if (info.status === 'progress') {
+          const pct = info.total ? Math.round(((info.loaded ?? 0) / info.total) * 100) : 0;
+          statusLine.textContent = S.segDownloading(
+            pct,
+            Math.round((performance.now() - t0) / 1000),
+          );
+        }
+      },
+    })) as BackgroundRemovalPipeline;
+    tfSegPipeKey = key;
+    return tfSegPipe;
+  } catch (e) {
+    console.warn('Transformers 分割模型加载失败，回退全图处理', e);
+    segBroken = true;
+    return null;
+  }
+}
+
+/** 处理开始时按需加载分割模型；失败不抛出（segBroken 标记，全白掩码回退） */
+async function ensureSegmenter(): Promise<void> {
+  if (personModeSelect.value !== 'person') return;
+  progressTitle.textContent = S.segPrepare;
+  const kind = segModelSelect.value;
+  if (kind === 'transformers') await loadTfSegmenter();
+  else await loadMpSegmenter(kind);
+  if (segBroken) statusLine.textContent = S.segFallback;
+}
+
+/** 单帧分割：对处理画布出掩码；推理异常回退全白掩码（不中断处理） */
+async function getPersonMask(timestampMs: number): Promise<PersonMask> {
+  const w = processCanvas.width;
+  const h = processCanvas.height;
+  if (segBroken) return whiteMask(w, h);
+  try {
+    if (segModelSelect.value === 'transformers') {
+      if (!tfSegPipe) return whiteMask(w, h);
+      const out = (await tfSegPipe(RawImage.fromCanvas(processCanvas))) as unknown;
+      const rgba = (Array.isArray(out) ? out[0] : out) as RawImage;
+      const n = rgba.width * rgba.height;
+      const data = new Uint8ClampedArray(n);
+      for (let p = 0; p < n; p++) data[p] = rgba.data[p * 4 + 3]; // alpha = 前景置信度
+      return { data, width: rgba.width, height: rgba.height };
+    }
+    if (!mpSegmenter) return whiteMask(w, h);
+    const result = mpSegmenter.segmentForVideo(processCanvas, Math.max(0, timestampMs));
+    const masks = result.confidenceMasks;
+    if (!masks || masks.length === 0) {
+      result.close();
+      return whiteMask(w, h);
+    }
+    // 选 person 通道：labels 正则，缺省 masks[1]（selfie 2 类：背景/人物），再缺省 masks[0]
+    let idx = -1;
+    try {
+      idx = mpSegmenter.getLabels().findIndex((l) => /person|human|selfie/i.test(l));
+    } catch {
+      /* labels 不可用时走缺省 */
+    }
+    const m = masks[idx >= 0 ? idx : masks.length > 1 ? 1 : 0];
+    const f = m.getAsFloat32Array();
+    const data = new Uint8ClampedArray(f.length);
+    for (let i = 0; i < f.length; i++) {
+      data[i] = Math.round(Math.min(1, Math.max(0, f[i])) * 255);
+    }
+    const mask = { data, width: m.width, height: m.height };
+    result.close();
+    return mask;
+  } catch (e) {
+    console.warn('单帧分割失败，本帧回退全图', e);
+    return whiteMask(w, h);
+  }
+}
+
+/** 掩码灰度画布（合成前按需平滑拉伸到输出尺寸） */
+const maskCanvas = document.createElement('canvas');
+const maskCtx = maskCanvas.getContext('2d', { willReadFrequently: true })!;
+const maskFitCanvas = document.createElement('canvas');
+const maskFitCtx = maskFitCanvas.getContext('2d', { willReadFrequently: true })!;
+
+/**
+ * 掩码与深度图合成（原站 pG 函数）：alpha>128 保留深度像素（硬阈值，无羽化）；
+ * 其余按 personBgSelect —— 'original' 拷回原始帧 RGB（同尺寸时），否则涂黑；输出恒不透明。
+ * 逐帧实时读取背景下拉，处理中改动下一帧即生效。
+ */
+function compositePersonMask(mask: PersonMask): void {
+  const w = depthCanvas.width;
+  const h = depthCanvas.height;
+  // 掩码尺寸与输出不一致时用 drawImage 平滑拉伸
+  let alpha = mask.data;
+  if (mask.width !== w || mask.height !== h) {
+    maskCanvas.width = mask.width;
+    maskCanvas.height = mask.height;
+    const img = maskCtx.createImageData(mask.width, mask.height);
+    for (let i = 0, p = 0; p < mask.data.length; i += 4, p++) {
+      img.data[i] = img.data[i + 1] = img.data[i + 2] = mask.data[p];
+      img.data[i + 3] = 255;
+    }
+    maskCtx.putImageData(img, 0, 0);
+    maskFitCanvas.width = w;
+    maskFitCanvas.height = h;
+    maskFitCtx.drawImage(maskCanvas, 0, 0, w, h);
+    alpha = maskFitCtx.getImageData(0, 0, w, h).data.filter((_, i) => i % 4 === 0);
+  }
+  const out = depthCtx.getImageData(0, 0, w, h);
+  const od = out.data;
+  const keepOriginal = personBgSelect.value === 'original';
+  const src = keepOriginal ? processCtx.getImageData(0, 0, w, h).data : null;
+  for (let i = 0, p = 0; i < od.length; i += 4, p++) {
+    if (alpha[p] > 128) continue; // 人物：保留深度
+    if (src) {
+      od[i] = src[i];
+      od[i + 1] = src[i + 1];
+      od[i + 2] = src[i + 2];
+    } else {
+      od[i] = od[i + 1] = od[i + 2] = 0;
+    }
+    od[i + 3] = 255;
+  }
+  depthCtx.putImageData(out, 0, 0);
+}
+
+// ---------------------------------------------------------------------------
 // 深度图渲染：方向反转 → 时域平滑（colormap 前的标量）→ 灰度/Jet 着色
 // （research/video-export-pipeline.md §4，原站 mG/hG 函数）
 // ---------------------------------------------------------------------------
@@ -615,7 +879,7 @@ function resetSmoothState(): void {
   prevSmooth = null;
 }
 
-function renderDepth(depth: RawImage): void {
+function renderDepth(depth: RawImage, mask: PersonMask | null = null): void {
   const src = depth.toCanvas() as HTMLCanvasElement;
   const sw = src.width;
   const sh = src.height;
@@ -657,6 +921,7 @@ function renderDepth(depth: RawImage): void {
   }
   mapCtx.putImageData(img, 0, 0);
   depthCtx.drawImage(mapCanvas, 0, 0, depthCanvas.width, depthCanvas.height);
+  if (mask) compositePersonMask(mask);
 }
 
 /** 处理画布尺寸：长边缩到设定值、保宽高比、两维向下取偶 */
@@ -1112,6 +1377,14 @@ async function startProcessing(): Promise<void> {
     const pipe = await loadDepthModel();
     if (cancelled) throw new Error(S.aborted);
 
+    // 仅人物：处理开始前加载分割模型（失败回退全白掩码，不阻断）
+    segBroken = false;
+    const personMode = personModeSelect.value === 'person';
+    if (personMode) {
+      await ensureSegmenter();
+      if (cancelled) throw new Error(S.aborted);
+    }
+
     const fps = Number(fpsSelect.value);
     const { w, h } = computeOutputSize();
     processCanvas.width = w;
@@ -1151,7 +1424,9 @@ async function startProcessing(): Promise<void> {
       await seekVideo(tSec);
       processCtx.drawImage(sourceVideo, 0, 0, w, h);
       const output = (await pipe(RawImage.fromCanvas(processCanvas))) as DepthEstimationOutput;
-      renderDepth(output.depth);
+      // 分割与深度推理在同一帧循环内串行完成（先深度后分割），失败回退全白掩码
+      const mask = personMode ? await getPersonMask(Math.round(tSec * 1000)) : null;
+      renderDepth(output.depth, mask);
       await session.encodeFrame(i);
 
       const done = i + 1;
@@ -1238,8 +1513,25 @@ export function initApp(): void {
   startButton.addEventListener('click', () => void startProcessing());
   cancelButton.addEventListener('click', cancelProcessing);
   downloadButton.addEventListener('click', downloadResult);
-  modelSelect.addEventListener('change', () => void refreshCacheHint());
+  modelSelect.addEventListener('change', () => {
+    syncNcWarning();
+    void refreshCacheHint();
+  });
   deviceSelect.addEventListener('change', () => void refreshCacheHint());
+
+  // 范围切「仅人物」时启用分割模型/背景下拉并预加载分割模型；切回「全图」时释放
+  personModeSelect.addEventListener('change', () => {
+    const person = personModeSelect.value === 'person';
+    segModelSelect.disabled = !person;
+    personBgSelect.disabled = !person;
+    if (person) {
+      if (!processing) void ensureSegmenter();
+    } else {
+      closeSegmenter();
+    }
+  });
+  // 切换分割后端后下次处理重新加载对应模型
+  segModelSelect.addEventListener('change', closeSegmenter);
 
   // 深度图样式：平滑滑杆实时显示数值；换方向/平滑系数时重置平滑状态（原站行为）
   smoothRange.addEventListener('input', () => {
@@ -1269,5 +1561,16 @@ export function initApp(): void {
 
   gpuBadge.textContent = 'gpu' in navigator ? S.gpuOk : S.gpuWasm;
 
+  syncNcWarning();
   void cleanupCaches().then(() => refreshCacheHint());
+
+  // e2e 自测钩子（仅 dev）：直接断言掩码合成逻辑
+  if (import.meta.env.DEV) {
+    (window as unknown as Record<string, unknown>).__dv = {
+      compositePersonMask,
+      depthCanvas,
+      processCanvas,
+      personBgSelect,
+    };
+  }
 }
