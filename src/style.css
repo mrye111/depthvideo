@@ -240,3 +240,10 @@
 }
   .shots-page .panel-card>.panel-head{padding:clamp(.6rem,1.5vh,.9rem) clamp(.75rem,1.5vw,1rem) 0}
   .shots-page .panel-body{padding:clamp(.6rem,1.5vh,.9rem) clamp(.75rem,1.5vw,1rem) clamp(.75rem,1.8vh,1rem)}
+  /* 运镜分析行（票 #29） */
+  .motion-row{display:flex;flex-direction:column;gap:.35rem;margin:-.15rem 0 .35rem .4rem;padding-left:.2rem;border-left:2px solid #7c6cf026}
+  .motion-btn{align-self:flex-start;min-height:1.9rem;padding:0 .7rem;font-size:.72rem}
+  .motion-chips{display:flex;flex-wrap:wrap;gap:.3rem}
+  .motion-chip{font-size:.62rem;padding:.2rem .5rem}
+  .motion-chip:before{width:.28rem;height:.28rem}
+  .motion-desc{margin:0;font-size:.75rem;color:var(--color-ink-soft);line-height:1.5}

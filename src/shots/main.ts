@@ -11,6 +11,12 @@ import { createFrameExtractor, type FrameExtractor } from './extract';
 import { Timeline } from './timeline';
 import { saveResult, loadResult } from './memory';
 import { buildExport, downloadJson } from './exporter';
+import {
+  probeService,
+  uploadVideo,
+  analyzeShot,
+  type MotionResult,
+} from './service';
 
 const WIN = 100;
 const FRAME_LEN = 27 * 48 * 3;
@@ -41,6 +47,7 @@ const epBadge = $<HTMLElement>('epBadge');
 const exportButton = $<HTMLButtonElement>('exportButton');
 const timelineCanvas = $<HTMLCanvasElement>('timelineCanvas');
 const thumbCanvas = $<HTMLCanvasElement>('thumbCanvas');
+const svcBadge = $<HTMLElement>('svcBadge');
 
 type Bound = { frame: number; prob: number };
 type Shot = {
@@ -66,6 +73,15 @@ let lastBounds: Bound[] = [];
 let lastProbs: Float32Array | null = null;
 let selectedShot = -1;
 let statusDyn: StatusDyn | null = null;
+
+// ---- 运镜分析服务状态（票 #29） ----
+let svcOnline = false;
+let svcVideoId: string | null = null;
+/** 每个镜头的分析状态：busy=进行中；done=有结果；error=可重试 */
+const motionState = new Map<
+  number,
+  { state: 'busy' | 'done' | 'error'; result?: MotionResult }
+>();
 
 function setStatus(dyn: StatusDyn | null): void {
   statusDyn = dyn;
@@ -139,6 +155,8 @@ async function loadVideo(file: File): Promise<void> {
   lastBounds = [];
   lastProbs = null;
   selectedShot = -1;
+  svcVideoId = null;
+  motionState.clear();
   exportButton.disabled = true;
   await waitMetadata();
   // 媒体面板切到已加载态：隐藏空态、显示视频
@@ -258,7 +276,106 @@ function renderCards(): void {
     card.addEventListener('click', () => selectShot(s.index - 1, true));
     shotCards.appendChild(card);
   }
+  // 运镜分析行（独立于卡片选择按钮，避免嵌套按钮）
+  for (const s of lastShots) {
+    shotCards.appendChild(renderMotionRow(s));
+  }
   resultCard.hidden = lastShots.length === 0;
+}
+
+/** 单个镜头的运镜分析行：按钮 + 结果区（票 #29） */
+function renderMotionRow(s: Shot): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'motion-row';
+  row.dataset.index = String(s.index);
+  const st = motionState.get(s.index);
+  const busy = st?.state === 'busy';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn btn-ghost motion-btn';
+  btn.disabled = !svcOnline || busy;
+  btn.textContent =
+    st?.state === 'error'
+      ? `${t('shots.analyzeFailed')} · ${t('shots.analyzeRetry')}`
+      : busy
+        ? t('shots.analyzing')
+        : t('shots.analyze');
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    void analyzeShotFlow(s.index);
+  });
+  row.appendChild(btn);
+  if (st?.state === 'done' && st.result) {
+    const res = document.createElement('div');
+    res.className = 'motion-result';
+    const chips = document.createElement('div');
+    chips.className = 'motion-chips';
+    for (const [dim, v] of Object.entries(st.result.labels)) {
+      const chip = document.createElement('span');
+      chip.className = 'chip motion-chip';
+      const tagKey = `shots.tag.${v.label}`;
+      const tagText = t(tagKey);
+      chip.textContent = `${t(`shots.dim.${dim}`)} ${tagText === tagKey ? v.label : tagText} ${v.prob.toFixed(2)}`;
+      chips.appendChild(chip);
+    }
+    res.appendChild(chips);
+    if (st.result.description) {
+      const desc = document.createElement('p');
+      desc.className = 'motion-desc';
+      desc.textContent = st.result.description;
+      res.appendChild(desc);
+    }
+    row.appendChild(res);
+  }
+  return row;
+}
+
+/** 运镜分析流程：按需整片上传（一次）→ 逐镜头分析 → 渲染结果 */
+async function analyzeShotFlow(index: number): Promise<void> {
+  const s = lastShots.find((x) => x.index === index);
+  if (!s || !videoFile || !svcOnline) return;
+  motionState.set(index, { state: 'busy' });
+  refreshMotionRow(index);
+  try {
+    if (!svcVideoId) {
+      const up = await uploadVideo(videoFile);
+      svcVideoId = up.videoId;
+    }
+    const result = await analyzeShot(svcVideoId, s.startSec, s.endSec);
+    motionState.set(index, { state: 'done', result });
+  } catch (e) {
+    console.warn('运镜分析失败', e);
+    motionState.set(index, { state: 'error' });
+  }
+  refreshMotionRow(index);
+}
+
+/** 只重渲染指定镜头的运镜行（避免整表重建打断缩略图/选中态） */
+function refreshMotionRow(index: number): void {
+  const s = lastShots.find((x) => x.index === index);
+  const old = shotCards.querySelector<HTMLElement>(`.motion-row[data-index="${index}"]`);
+  if (!s || !old) return;
+  old.replaceWith(renderMotionRow(s));
+}
+
+/** 服务探测：徽标与按钮可用性（离线降级） */
+async function refreshServiceState(): Promise<void> {
+  const h = await probeService();
+  const was = svcOnline;
+  svcOnline = h.online && h.modelLoaded;
+  svcBadge.hidden = false;
+  svcBadge.className = svcOnline ? 'chip chip-ok' : 'chip chip-warn';
+  svcBadge.textContent = t(svcOnline ? 'shots.svcOnline' : 'shots.svcOffline');
+  svcBadge.title = svcOnline ? '' : t('shots.svcOfflineHint');
+  if (was !== svcOnline) {
+    // 服务可用性变化时刷新所有运镜按钮的 disabled 态
+    shotCards.querySelectorAll<HTMLButtonElement>('.motion-btn').forEach((btn) => {
+      const row = btn.closest('.motion-row') as HTMLElement | null;
+      const idx = row ? Number(row.dataset.index) : -1;
+      const st = motionState.get(idx);
+      btn.disabled = !svcOnline || st?.state === 'busy';
+    });
+  }
 }
 
 function selectShot(idx: number, seek: boolean): void {
@@ -388,6 +505,10 @@ function rerender(): void {
   if (transnetBackend && !epBadge.hidden) {
     epBadge.textContent = t('shots.backend', { ep: transnetBackend });
   }
+  if (!svcBadge.hidden) {
+    svcBadge.textContent = t(svcOnline ? 'shots.svcOnline' : 'shots.svcOffline');
+    svcBadge.title = svcOnline ? '' : t('shots.svcOfflineHint');
+  }
   renderCards();
 }
 
@@ -421,6 +542,9 @@ exportButton.addEventListener('click', () => {
       endSec: s.endSec,
       durationSec: s.endSec - s.startSec,
       boundaryProbBefore: s.boundaryProbBefore,
+      ...(motionState.get(s.index)?.state === 'done'
+        ? { motion: motionState.get(s.index)!.result }
+        : {}),
     })),
   );
   downloadJson(data, videoFile.name.replace(/\.[^.]+$/, ''));
@@ -465,3 +589,5 @@ document.querySelectorAll<HTMLButtonElement>('.lang-btn').forEach((btn) => {
 // 启动：同步 <html lang> 与偏好，渲染全页
 setLang(getLang());
 rerender();
+void refreshServiceState();
+setInterval(() => void refreshServiceState(), 5_000);

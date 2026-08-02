@@ -6,6 +6,7 @@
  */
 import { chromium } from 'playwright';
 import { execFileSync } from 'node:child_process';
+import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -92,6 +93,77 @@ const parseCards = (page) =>
 
 ensureFixture();
 
+/** 运镜服务桩：罐装 /health、/videos、/analyze（spec #26 契约同构） */
+function startStubService() {
+  const sockets = new Set();
+  const srv = http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+    if (req.url === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok', modelLoaded: true }));
+    } else if (req.url === '/videos') {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ videoId: 'stub-video', durationSec: 5.04, fps: 25 }));
+      });
+    } else if (req.url === '/analyze') {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            labels: {
+              dolly: { label: 'dolly-in', prob: 0.87 },
+              pan: { label: 'pan-left', prob: 0.66 },
+              shaking: { label: 'minimal-shaking', prob: 0.91 },
+              speed: { label: 'regular-speed', prob: 0.78 },
+            },
+            description: 'The camera pushes in steadily with minimal shaking.',
+          }),
+        );
+      });
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+  return new Promise((resolve, reject) => {
+    srv.once('error', reject);
+    srv.on('connection', (s) => {
+      sockets.add(s);
+      s.on('close', () => sockets.delete(s));
+    });
+    srv.listen('8788', '127.0.0.1', () => {
+      // close() 不销毁 keep-alive 连接：包装一层强制全断，保证页面能探到离线
+      const origClose = srv.close.bind(srv);
+      srv.close = (cb) => {
+        for (const s of sockets) s.destroy();
+        return origClose(cb);
+      };
+      resolve(srv);
+    });
+  });
+}
+
+const waitSvcBadge = (page, text, timeout = 20_000) =>
+  page.waitForFunction(
+    (t) => {
+      const b = document.getElementById('svcBadge');
+      return b && !b.hidden && (b.textContent || '').includes(t);
+    },
+    text,
+    { timeout, polling: 500 },
+  );
+
 const context = await chromium.launchPersistentContext(profile, {
   channel: 'chrome',
   headless: true,
@@ -117,6 +189,11 @@ try {
   check((await scanMissingKeys(page)).length === 0, 'EN 无缺失 key');
   await page.click('.lang-btn[data-lang="zh"]');
   await page.waitForSelector('.lang-btn[data-lang="zh"].is-active');
+
+  // ---- 运镜服务离线降级（桩未启动时） ----
+  console.log('— 运镜服务离线降级');
+  await waitSvcBadge(page, '运镜服务离线');
+  check(true, '离线徽标显示');
 
   // ---- 上传 + 元信息 ----
   console.log('— 上传与元信息');
@@ -239,6 +316,65 @@ try {
     Object.keys(localStorage).filter((k) => k.startsWith('shots.result.v1.')),
   );
   check(stored.length === 1, 'localStorage 记忆键存在');
+
+  // 离线时运镜按钮禁用
+  check(
+    await page.evaluate(() =>
+      Array.from(document.querySelectorAll('.motion-btn')).every((b) => b.disabled),
+    ),
+    '离线时运镜按钮全部禁用',
+  );
+
+  // ---- 桩服务在线：运镜分析全流程 ----
+  console.log('— 桩服务在线：运镜分析');
+  const stub = await startStubService();
+  try {
+    await waitSvcBadge(page, '运镜分析可用');
+    check(true, '在线徽标显示（重探恢复，无需刷新页面）');
+    check(
+      await page.evaluate(() =>
+        Array.from(document.querySelectorAll('.motion-btn')).every((b) => !b.disabled),
+      ),
+      '在线后运镜按钮启用',
+    );
+    await page.locator('.motion-row[data-index="1"] .motion-btn').click();
+    await page.waitForSelector('.motion-row[data-index="1"] .motion-chips .motion-chip', {
+      timeout: 30_000,
+    });
+    const chipTexts = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('.motion-row[data-index="1"] .motion-chip')).map(
+        (c) => c.textContent.trim(),
+      ),
+    );
+    console.log('  chips:', JSON.stringify(chipTexts));
+    check(chipTexts.length >= 3, `维度标签渲染 >=3（实际 ${chipTexts.length}）`);
+    check(chipTexts.some((s) => s.includes('前推')), 'dolly 标签翻译（前推）');
+    check(chipTexts.some((s) => s.includes('0.87')), '置信度渲染');
+    const desc = (
+      await page.textContent('.motion-row[data-index="1"] .motion-desc')
+    )?.trim();
+    check(!!desc && desc.includes('pushes in'), '一句话描述渲染');
+
+    // 导出 JSON：已分析镜头含 motion，未分析不含
+    const [download2] = await Promise.all([
+      page.waitForEvent('download', { timeout: 15_000 }),
+      page.click('#exportButton'),
+    ]);
+    const export2 = JSON.parse(fs.readFileSync(await download2.path(), 'utf8'));
+    check(
+      export2.shots[0].motion && export2.shots[0].motion.labels.dolly.label === 'dolly-in',
+      '导出 shot1 含 motion.labels',
+    );
+    check(
+      export2.shots[0].motion.description.includes('pushes in'),
+      '导出 shot1 含 motion.description',
+    );
+    check(!('motion' in export2.shots[1]), '未分析镜头无 motion 字段');
+  } finally {
+    stub.close();
+  }
+  await waitSvcBadge(page, '运镜服务离线');
+  check(true, '桩关闭后徽标回到离线（降级恢复）');
 
   // ---- 取消路径（wasm 慢速下点取消；webgpu 过快则跳过） ----
   if (device === 'wasm') {

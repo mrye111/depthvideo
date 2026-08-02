@@ -8,6 +8,11 @@ export type ExportShot = {
   endSec: number;
   durationSec: number;
   boundaryProbBefore: number | null;
+  /** 已做运镜分析的镜头携带（票 #29）：8 维标签 + 一句话描述 */
+  motion?: {
+    labels: Record<string, { label: string; prob: number }>;
+    description: string;
+  };
 };
 
 export type ExportData = {
@@ -40,6 +45,7 @@ export function buildExport(
       endSec: round3(s.endSec),
       durationSec: round3(s.durationSec),
       boundaryProbBefore: s.boundaryProbBefore === null ? null : round3(s.boundaryProbBefore),
+      ...(s.motion ? { motion: s.motion } : {}),
     })),
     meta: {
       transnetModel: 'transnetv2-webgpu.onnx (TransNet V2, MIT; browser-patched)',
