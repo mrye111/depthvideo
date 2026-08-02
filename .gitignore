@@ -25,3 +25,8 @@ dist/
 .warp/
 .windsurf/
 .pi-subagents/
+server/.venv/
+server/weights/
+server/*.log
+__pycache__/
+*.pyc
