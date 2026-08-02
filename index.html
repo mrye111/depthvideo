@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="apple-touch-icon" href="/logo.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+
+    <title>视频深度图提取 · Depth Video</title>
+    <meta
+      name="description"
+      content="视频深度图提取：在浏览器本地将视频逐帧转为深度图视频。基于 Depth Anything V2，支持 WebGPU，无需上传、无需 API，可导出 MP4 / WebM。"
+    />
+    <meta
+      name="keywords"
+      content="视频深度图提取,深度图提取,视频转深度图,深度估计,Depth Anything V2,深度图视频,在线深度图,浏览器深度图,WebGPU"
+    />
+    <meta name="author" content="Depth Video" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#5c4fd6" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:locale" content="zh_CN" />
+    <meta property="og:title" content="视频深度图提取 · Depth Video" />
+    <meta
+      property="og:description"
+      content="本地视频深度图提取工具：上传视频即可逐帧生成深度图，支持全图/仅人物、灰度与热力样式，全程浏览器推理，数据不上传。"
+    />
+    <meta property="og:site_name" content="Depth Video" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="视频深度图提取 · Depth Video" />
+    <meta
+      name="twitter:description"
+      content="在浏览器中完成视频深度图提取：Depth Anything V2 本地推理，无需 API，可导出深度视频。"
+    />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebApplication",
+        "name": "视频深度图提取",
+        "alternateName": "Depth Video",
+        "applicationCategory": "MultimediaApplication",
+        "operatingSystem": "Web Browser",
+        "description": "视频深度图提取工具：在浏览器本地将视频转为深度图视频。基于 Depth Anything V2，支持全图或仅人物深度着色，可导出 MP4 / WebM，全程本地推理，无需上传。",
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "CNY"
+        },
+        "featureList": [
+          "视频深度图提取",
+          "Depth Anything V2 本地推理",
+          "WebGPU / WASM 加速",
+          "全图或仅人物深度着色",
+          "导出 MP4 / WebM",
+          "模型浏览器缓存，可离线复用"
+        ],
+        "inLanguage": "zh-CN"
+      }
+    </script>
+    <script type="module" src="/src/main.ts"></script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <!-- 供爬虫与无 JS 环境读取的核心说明 -->
+    <noscript>
+      <main>
+        <h1>视频深度图提取</h1>
+        <p>
+          Depth Video 是一款浏览器端视频深度图提取工具。上传视频后，基于 Depth Anything V2
+          在本地逐帧生成深度图，支持全图或仅人物范围、灰度/热力样式，并可导出 MP4 / WebM。全程本地推理，无需上传、无需 API。
+        </p>
+      </main>
+    </noscript>
+  </body>
+</html>
