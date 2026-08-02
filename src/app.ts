@@ -280,10 +280,13 @@ function setOutputBadge(d: Dyn): void {
 // ---------------------------------------------------------------------------
 // 模型表（research/inference-pipeline.md §2，原站 KH 常量：2 模型 × fp16/fp32）
 // ---------------------------------------------------------------------------
+/** 权重量化/精度档位：fp16/fp32 为现有档；q4f16/q4 为 4bit 量化档（V2 Large 引入） */
+type ModelDtype = 'fp16' | 'fp32' | 'q4f16' | 'q4';
+
 type ModelOption = {
   id: string;
-  dtype: 'fp16' | 'fp32';
-  /** 下拉显示名（语言中性，含 f16/f32 后缀） */
+  dtype: ModelDtype;
+  /** 下拉显示名（语言中性，含 f16/f32/q4f16/q4 后缀） */
   name: string;
   /** 下载量标注（MB 数字） */
   mb: number;
@@ -293,32 +296,64 @@ type ModelOption = {
   timeoutMs: number;
 };
 
-const MODEL_OPTIONS: ModelOption[] = (
-  [
-    {
-      id: 'onnx-community/depth-anything-v2-small-ONNX',
-      base: 'V2 Small · ONNX',
-      recommended: true,
-      sizes: { fp16: 48, fp32: 94 },
-      timeoutMs: 180_000,
-    },
-    {
-      id: 'onnx-community/depth-anything-v2-base-ONNX',
-      base: 'V2 Base · ONNX',
-      recommended: false,
-      sizes: { fp16: 187, fp32: 371 },
-      timeoutMs: 360_000,
-    },
-  ] as const
-).flatMap((m) =>
-  (['fp16', 'fp32'] as const).map((dtype) => ({
+/** 单档定义：dtype 后缀、下载量、缓存阈值、加载超时逐档独立 */
+type ModelDtypeOption = {
+  dtype: ModelDtype;
+  mb: number;
+  cachedBytesThreshold: number;
+  timeoutMs: number;
+};
+
+/** 模型族：一族提供哪些 dtype 档由族自定义（不再全族统一 fp16+fp32） */
+type ModelFamily = {
+  id: string;
+  base: string;
+  recommended: boolean;
+  dtypes: readonly ModelDtypeOption[];
+};
+
+/** dtype → 展示后缀（fp16/fp32 沿用原 f16/f32 短写，量化档用原名） */
+function dtypeSuffix(dtype: ModelDtype): string {
+  return dtype === 'fp16' ? 'f16' : dtype === 'fp32' ? 'f32' : dtype;
+}
+
+/** dtype → 权重文件名匹配：fp32 为 model.onnx，其余为 model_{dtype}.onnx；统一识别外部 _data 文件 */
+function modelOnnxUrlRe(dtype: string): RegExp {
+  return dtype === 'fp32'
+    ? /\/onnx\/model\.onnx(_data)?(\?|$)/i
+    : new RegExp(`/onnx/model_${dtype}\\.onnx(_data)?(\\?|$)`, 'i');
+}
+
+const MODEL_FAMILIES: readonly ModelFamily[] = [
+  {
+    id: 'onnx-community/depth-anything-v2-small-ONNX',
+    base: 'V2 Small · ONNX',
+    recommended: true,
+    dtypes: [
+      { dtype: 'fp16', mb: 48, cachedBytesThreshold: 20e6, timeoutMs: 180_000 },
+      { dtype: 'fp32', mb: 94, cachedBytesThreshold: 40e6, timeoutMs: 180_000 },
+    ],
+  },
+  {
+    id: 'onnx-community/depth-anything-v2-base-ONNX',
+    base: 'V2 Base · ONNX',
+    recommended: false,
+    dtypes: [
+      { dtype: 'fp16', mb: 187, cachedBytesThreshold: 20e6, timeoutMs: 360_000 },
+      { dtype: 'fp32', mb: 371, cachedBytesThreshold: 40e6, timeoutMs: 360_000 },
+    ],
+  },
+];
+
+const MODEL_OPTIONS: ModelOption[] = MODEL_FAMILIES.flatMap((m) =>
+  m.dtypes.map((d) => ({
     id: m.id,
-    dtype,
-    name: `${m.base} · ${dtype === 'fp16' ? 'f16' : 'f32'}`,
-    mb: m.sizes[dtype],
-    recommended: m.recommended && dtype === 'fp16',
-    cachedBytesThreshold: dtype === 'fp16' ? 20e6 : 40e6,
-    timeoutMs: m.timeoutMs,
+    dtype: d.dtype,
+    name: `${m.base} · ${dtypeSuffix(d.dtype)}`,
+    mb: d.mb,
+    recommended: m.recommended && d.dtype === 'fp16',
+    cachedBytesThreshold: d.cachedBytesThreshold,
+    timeoutMs: d.timeoutMs,
   })),
 );
 
@@ -454,10 +489,7 @@ async function probeCached(spec: ModelSpec, modelId: string): Promise<boolean> {
   try {
     const cache = await caches.open(CACHE_KEY);
     const keys = await cache.keys();
-    const onnxRe =
-      spec.dtype === 'fp16'
-        ? /\/onnx\/model_fp16\.onnx(_data)?(\?|$)/i
-        : /\/onnx\/model\.onnx(\?|$)/i;
+    const onnxRe = modelOnnxUrlRe(spec.dtype);
     let bytes = 0;
     let hasConfig = false;
     for (const req of keys) {
@@ -490,10 +522,7 @@ async function probeAllCached(): Promise<{ cachedKeys: Set<string>; occupiedByte
     const cache = await caches.open(CACHE_KEY);
     const keys = await cache.keys();
     for (const opt of MODEL_OPTIONS) {
-      const onnxRe =
-        opt.dtype === 'fp16'
-          ? /\/onnx\/model_fp16\.onnx(_data)?(\?|$)/i
-          : /\/onnx\/model\.onnx(\?|$)/i;
+      const onnxRe = modelOnnxUrlRe(opt.dtype);
       let bytes = 0;
       let hasConfig = false;
       for (const req of keys) {
@@ -711,7 +740,7 @@ async function loadDepthModel(): Promise<DepthEstimationPipeline> {
       const pipe = await withTimeout(
         pipeline('depth-estimation', variant, {
           device: device as 'webgpu' | 'wasm',
-          dtype: spec.dtype as 'fp16' | 'fp32',
+          dtype: spec.dtype as ModelDtype,
           progress_callback: (info: {
             status: string;
             file?: string;
