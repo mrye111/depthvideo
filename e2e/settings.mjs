@@ -71,43 +71,45 @@ async function grabDownload(page, file) {
  * 页内轮询 liveFrameText，捕获相邻两个已处理帧的画布内容并返回逐像素平均绝对差。
  * 帧循环末尾有 rAF 让出，30ms 轮询能赶上每一帧。
  */
+// 采样策略：不依赖 liveFrameText 文案，直接盯 depthCanvas 的换帧（像素变化）。
+// 文案更新与 canvas 绘制之间存在竞态（曾导致相邻帧差异偶发采到 ~1.5 vs ~31），
+// 因此连续收集多次真实换帧差异并取中位数，消除单对采样异常。
 async function captureConsecutiveDiff(page) {
   return page.evaluate(
     () =>
       new Promise((resolve) => {
-        const tag = document.getElementById('liveFrameText');
         const c = document.getElementById('depthCanvas');
         const ctx = c.getContext('2d');
-        let prevFrame = -1;
-        let prevData = null;
-        const cleanup = () => {
+        const frameDiff = (a, b) => {
+          let sum = 0;
+          let cnt = 0;
+          for (let i = 0; i < a.length; i += 40) {
+            sum += Math.abs(a[i] - b[i]);
+            cnt++;
+          }
+          return sum / cnt;
+        };
+        let prev = ctx.getImageData(0, 0, c.width, c.height).data;
+        const diffs = [];
+        const t0 = Date.now();
+        const finish = () => {
           clearInterval(timer);
-          clearTimeout(to);
+          if (!diffs.length) return resolve(null);
+          const sorted = [...diffs].sort((a, b) => a - b);
+          resolve({ n: diffs.length, diff: sorted[Math.floor(sorted.length / 2)] });
         };
         const timer = setInterval(() => {
-          const m = /FRAME (\d+)/.exec(tag.textContent || '');
-          if (!m) return;
-          const n = +m[1];
-          if (n === prevFrame) return;
           const d = ctx.getImageData(0, 0, c.width, c.height).data;
-          if (prevData && n === prevFrame + 1) {
-            let sum = 0;
-            let cnt = 0;
-            for (let i = 0; i < d.length; i += 40) {
-              sum += Math.abs(d[i] - prevData[i]);
-              cnt++;
-            }
-            cleanup();
-            resolve({ n, diff: sum / cnt });
-            return;
+          const delta = frameDiff(d, prev);
+          if (delta > 0.05) {
+            // 画布确实重绘了：记一次真实的相邻渲染帧差异
+            diffs.push(delta);
+            prev = d;
+            if (diffs.length >= 5) return finish();
           }
-          prevFrame = n;
-          prevData = d;
-        }, 30);
-        const to = setTimeout(() => {
-          cleanup();
-          resolve(null);
-        }, 120_000);
+          if (Date.now() - t0 > 15_000) return finish();
+        }, 40);
+        setTimeout(finish, 20_000);
       }),
   );
 }
@@ -278,6 +280,26 @@ try {
     () => !document.getElementById('syncPlayButton').disabled,
   );
   if (!syncEnabled) throw new Error('导出完成后同步播放未启用');
+  // 用例D 导出结束后源视频停在裁切出点（≈2.1s），结果视频全长 2.125s；
+  // 直接同步会把结果视频 seek 到片尾立即 ended。先将源视频倒回 0 再测同步启停。
+  await pd.evaluate(() => {
+    document.getElementById('sourceVideo').currentTime = 0;
+  });
+  await pd.waitForFunction(
+    () => document.getElementById('sourceVideo').currentTime < 0.2,
+    null,
+    { timeout: 10_000 },
+  );
+  // 等两个视频均可播放再点击，避免 headless 下解码未就绪导致 play() 悬起（偶发 10s 超时）
+  await pd.waitForFunction(
+    () => {
+      const s = document.getElementById('sourceVideo');
+      const r = document.getElementById('resultVideo');
+      return s.readyState >= 2 && r.readyState >= 2;
+    },
+    null,
+    { timeout: 30_000 },
+  );
   await pd.click('#syncPlayButton');
   await pd.waitForFunction(
     () => {
@@ -286,7 +308,7 @@ try {
       return !s.paused && !r.paused;
     },
     null,
-    { timeout: 10_000 },
+    { timeout: 30_000 },
   );
   const syncLabel = (await pd.textContent('#syncPlayButton')).trim();
   if (!syncLabel.includes('停止同步')) throw new Error(`同步播放文案异常：${syncLabel}`);
@@ -298,7 +320,7 @@ try {
       return s.paused && r.paused;
     },
     null,
-    { timeout: 10_000 },
+    { timeout: 30_000 },
   );
   console.log('[sync] 断言通过：同步播放启动/停止正常');
 

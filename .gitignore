@@ -3,3 +3,24 @@ research-snapshot/
 .recon/
 node_modules/
 dist/
+.dev.log
+
+# 环境生成的 AI 工具配置目录（非项目文件）
+.agents/
+.augment/
+.claude/
+.codebuddy/
+.codewhale/
+.continue/
+.cursor/
+.factory/
+.gemini/
+.github/prompts/
+.kilocode/
+.kiro/
+.opencode/
+.qoder/
+.roo/
+.trae/
+.warp/
+.windsurf/

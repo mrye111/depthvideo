@@ -35,8 +35,20 @@ async function preparePage(page, { size = '384', fps = '8', device }) {
   );
 }
 
-/** 跑一轮完整处理，采样 statusLine 文案；返回 badge */
+/** 跑一轮完整处理，采样 statusLine 文案；返回 badge。
+ *  除轮询外还挂 MutationObserver 全量记录状态变化——
+ *  「人物分割不可用，已回退为全图处理」等瞬态文案可能被下一帧进度瞬间覆盖，
+ *  200ms 轮询有概率采不到（曾因此偶发失败）。 */
 async function runToDone(page, label, statusSamples) {
+  await page.evaluate(() => {
+    window.__statusLog = [];
+    const el = document.getElementById('statusLine');
+    new MutationObserver(() => {
+      const s = el.textContent.trim();
+      const log = window.__statusLog;
+      if (s && log[log.length - 1] !== s) log.push(s);
+    }).observe(el, { childList: true, characterData: true, subtree: true });
+  });
   await page.click('#startButton');
   const sampler = setInterval(async () => {
     try {
@@ -56,6 +68,8 @@ async function runToDone(page, label, statusSamples) {
   } finally {
     clearInterval(sampler);
   }
+  const observed = await page.evaluate(() => window.__statusLog || []);
+  for (const s of observed) statusSamples.add(s);
   const badge = (await page.textContent('#outputBadge')).trim();
   const status = ((await page.textContent('#statusLine')) || '').trim();
   console.log(`[${label}] badge=${badge} status=${status.slice(0, 140)}`);
