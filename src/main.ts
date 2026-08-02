@@ -3,6 +3,7 @@ import '@fontsource-variable/outfit';
 import '@fontsource-variable/plus-jakarta-sans';
 import '@fontsource-variable/jetbrains-mono';
 import './style.css';
+import { initApp } from './app';
 
 /**
  * 片1：静态 UI 骨架。
@@ -332,3 +333,6 @@ const app = document.querySelector<HTMLDivElement>('#app');
 if (app) {
   app.innerHTML = template;
 }
+
+// 片2：核心推理链路（上传 → 解码 → 深度推理 → 预览/进度/取消）
+initApp();
