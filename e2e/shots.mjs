@@ -85,7 +85,7 @@ const parseCards = (page) =>
   page.evaluate(() =>
     Array.from(document.querySelectorAll('#shotCards .shot-card')).map((card) => {
       const m = /(\d+)–(\d+)帧/.exec(card.textContent);
-      const active = card.classList.contains('border-accent');
+      const active = card.classList.contains('is-active');
       return { start: Number(m[1]), end: Number(m[2]), active };
     }),
   );

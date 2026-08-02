@@ -23,6 +23,7 @@ const fileInput = $<HTMLInputElement>('fileInput');
 const pickButton = $<HTMLButtonElement>('pickButton');
 const dropZone = $<HTMLElement>('dropZone');
 const fileNameEl = $<HTMLElement>('fileName');
+const dropEmpty = $<HTMLElement>('dropEmpty');
 const previewCard = $<HTMLElement>('previewCard');
 const preview = $<HTMLVideoElement>('preview');
 const metaRes = $<HTMLElement>('metaRes');
@@ -140,6 +141,11 @@ async function loadVideo(file: File): Promise<void> {
   selectedShot = -1;
   exportButton.disabled = true;
   await waitMetadata();
+  // 媒体面板切到已加载态：隐藏空态、显示视频
+  dropEmpty.hidden = true;
+  preview.hidden = false;
+  dropZone.classList.add('has-media');
+  dropZone.classList.remove('is-pickable');
   previewCard.hidden = false;
   metaRes.textContent = `${preview.videoWidth}×${preview.videoHeight}`;
   metaDur.textContent = `${preview.duration.toFixed(2)} s`;
@@ -237,8 +243,7 @@ function renderCards(): void {
     const card = document.createElement('button');
     card.type = 'button';
     card.className =
-      'shot-card flex items-center gap-3 rounded-lg border border-line p-2 text-left hover:border-accent' +
-      (s.index - 1 === selectedShot ? ' border-accent ring-1 ring-accent' : '');
+      'shot-card' + (s.index - 1 === selectedShot ? ' is-active' : '');
     card.dataset.index = String(s.index);
     const conf =
       s.boundaryProbBefore !== null
@@ -260,9 +265,7 @@ function selectShot(idx: number, seek: boolean): void {
   selectedShot = idx;
   timeline.setSelected(idx);
   Array.from(shotCards.children).forEach((el, i) => {
-    (el as HTMLElement).classList.toggle('border-accent', i === idx);
-    (el as HTMLElement).classList.toggle('ring-1', i === idx);
-    (el as HTMLElement).classList.toggle('ring-accent', i === idx);
+    (el as HTMLElement).classList.toggle('is-active', i === idx);
   });
   if (seek && lastShots[idx]) {
     preview.currentTime = lastShots[idx].startSec + 0.001;
@@ -431,14 +434,19 @@ fileInput.addEventListener('change', () => {
 });
 dropZone.addEventListener('dragover', (e) => {
   e.preventDefault();
-  dropZone.classList.add('border-accent');
+  dropZone.classList.add('dragging');
 });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('border-accent'));
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragging'));
 dropZone.addEventListener('drop', (e) => {
   e.preventDefault();
-  dropZone.classList.remove('border-accent');
+  dropZone.classList.remove('dragging');
   const f = e.dataTransfer?.files?.[0];
   if (f) void loadVideo(f);
+});
+dropZone.addEventListener('click', (e) => {
+  // 空态（含选择按钮之外的面板区域）点击唤起文件选择；已加载时点视频不拦截
+  if (e.target === pickButton || e.target === preview) return;
+  if (!dropEmpty.hidden) fileInput.click();
 });
 startButton.addEventListener('click', () => void startDetection());
 cancelButton.addEventListener('click', () => {

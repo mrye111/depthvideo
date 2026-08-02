@@ -14,76 +14,104 @@
     <meta name="theme-color" content="#5c4fd6" />
     <script type="module" src="/src/shots/main.ts"></script>
   </head>
-  <body>
-    <header class="mx-auto flex max-w-4xl items-center justify-between gap-3 px-4 py-3">
-      <div class="flex items-center gap-2">
-        <img src="/logo.png" alt="" class="h-7 w-7" />
-        <h1 class="text-lg font-semibold" data-i18n="shots.title">镜头分析</h1>
-        <span id="epBadge" class="chip" hidden></span>
-      </div>
-      <div class="flex items-center gap-3">
-        <a href="/" class="text-sm text-accent hover:underline" data-i18n="shots.back">← 返回深度工具</a>
-        <div class="lang-switch" role="group" aria-label="语言">
-          <button type="button" class="lang-btn" data-lang="zh" aria-pressed="false">中文</button>
-          <button type="button" class="lang-btn" data-lang="en" aria-pressed="false">EN</button>
+  <body class="shots-page">
+    <div class="shots-shell">
+      <header class="app-header">
+        <div class="brand-lockup">
+          <img class="brand-logo" src="/logo.png" alt="" />
+          <div class="brand-text">
+            <p class="eyebrow">depthvideo</p>
+            <h1 class="brand-mark text-xl" data-i18n="shots.title">镜头分析</h1>
+          </div>
+          <span id="epBadge" class="chip" hidden></span>
+          <span id="svcBadge" class="chip chip-warn" hidden></span>
         </div>
-      </div>
-    </header>
-
-    <main class="mx-auto max-w-4xl space-y-4 px-4 pb-8">
-      <!-- 上传区 -->
-      <section id="dropZone" class="rounded-xl border-2 border-dashed border-line bg-surface p-6 text-center">
-        <input type="file" id="fileInput" accept="video/*,.mp4,.webm,.mov,.mkv,.m4v" hidden />
-        <p class="text-sm text-muted">
-          <span data-i18n="shots.dropHint">拖放视频到这里，或</span>
-          <button type="button" id="pickButton" class="control ml-1" data-i18n="shots.pick">选择视频</button>
-        </p>
-        <p id="fileName" class="mt-2 font-mono text-xs text-muted" hidden></p>
-      </section>
-
-      <!-- 预览 + 元信息 + 控制 -->
-      <section id="previewCard" class="rounded-xl border border-line bg-surface p-4" hidden>
-        <video id="preview" class="mx-auto w-full max-w-full rounded-lg bg-black object-contain" style="max-height: 52vh" controls muted playsinline></video>
-        <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-muted">
-          <span><span data-i18n="shots.metaRes">分辨率</span>：<span id="metaRes">–</span></span>
-          <span><span data-i18n="shots.metaDur">时长</span>：<span id="metaDur">–</span></span>
-          <span><span data-i18n="shots.metaFps">帧率</span>：<span id="metaFps">–</span></span>
-        </div>
-        <p id="longVideoHint" class="mt-1 text-xs text-warn" hidden></p>
-        <div class="mt-3 flex items-center gap-3">
-          <button type="button" id="startButton" class="control" data-i18n="shots.start">开始检测</button>
-          <button type="button" id="cancelButton" class="control" data-i18n="shots.cancel" disabled>取消</button>
-          <div class="flex-1">
-            <div class="h-1.5 w-full overflow-hidden rounded bg-line">
-              <div id="progressBar" class="h-full w-0 bg-accent transition-[width]"></div>
-            </div>
+        <div class="flex items-center gap-2">
+          <a href="/" class="header-link" data-i18n="shots.back">← 返回深度工具</a>
+          <div class="lang-switch" role="group" aria-label="语言">
+            <button type="button" class="lang-btn" data-lang="zh" aria-pressed="false">中文</button>
+            <button type="button" class="lang-btn" data-lang="en" aria-pressed="false">EN</button>
           </div>
         </div>
-        <p id="statusLine" class="mt-2 text-sm text-muted"></p>
-      </section>
+      </header>
 
-      <!-- 镜头列表 -->
-      <section id="resultCard" class="rounded-xl border border-line bg-surface p-4" hidden>
-        <div class="mb-2 flex items-center justify-between">
-          <h2 class="text-base font-semibold" data-i18n="shots.listTitle">镜头列表</h2>
-          <button type="button" id="exportButton" class="control" data-i18n="shots.export" disabled>导出 JSON</button>
-        </div>
-        <canvas id="timelineCanvas" class="w-full rounded-lg"></canvas>
-        <div id="shotCards" class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2"></div>
-      </section>
+      <div class="shots-grid">
+        <!-- 左栏：上传 + 预览 + 检测控制 -->
+        <section class="glass glass-strong panel-card">
+          <div class="panel-head">
+            <h2 class="section-title" data-i18n="shots.secVideo">视频</h2>
+            <span id="fileName" class="chip" hidden></span>
+          </div>
+          <div class="panel-body">
+            <div id="dropZone" class="drop-zone is-pickable media-panel shots-media">
+              <input type="file" id="fileInput" accept="video/*,.mp4,.webm,.mov,.mkv,.m4v" hidden />
+              <div id="dropEmpty" class="panel-empty">
+                <p class="field-hint">
+                  <span data-i18n="shots.dropHint">拖放视频到这里，或</span>
+                </p>
+                <button type="button" id="pickButton" class="btn btn-primary" data-i18n="shots.pick">
+                  选择视频
+                </button>
+              </div>
+              <video id="preview" class="media-el" controls muted playsinline hidden></video>
+            </div>
 
-      <p id="emptyHint" class="py-10 text-center text-sm text-muted" data-i18n="shots.empty">
+            <div id="previewCard" class="mt-3" hidden>
+              <div class="flex flex-wrap items-center gap-x-5 gap-y-1 text-sm">
+                <span class="field-label !mb-0">
+                  <span data-i18n="shots.metaRes">分辨率</span>&nbsp;<span id="metaRes" class="font-mono">–</span>
+                </span>
+                <span class="field-label !mb-0">
+                  <span data-i18n="shots.metaDur">时长</span>&nbsp;<span id="metaDur" class="font-mono">–</span>
+                </span>
+                <span class="field-label !mb-0">
+                  <span data-i18n="shots.metaFps">帧率</span>&nbsp;<span id="metaFps" class="font-mono">–</span>
+                </span>
+              </div>
+              <p id="longVideoHint" class="field-hint text-warn" hidden></p>
+              <div class="mt-3 flex items-center gap-2">
+                <button type="button" id="startButton" class="btn btn-start flex-1" data-i18n="shots.start">
+                  开始检测
+                </button>
+                <button type="button" id="cancelButton" class="btn btn-ghost" data-i18n="shots.cancel" disabled>
+                  取消
+                </button>
+              </div>
+              <div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-[#7c6cf026]">
+                <div id="progressBar" class="h-full w-0 rounded-full bg-[#7c6cf0] transition-[width]"></div>
+              </div>
+              <p id="statusLine" class="field-hint mt-1.5"></p>
+            </div>
+          </div>
+        </section>
+
+        <!-- 右栏：时间轴 + 镜头卡片 -->
+        <section id="resultCard" class="glass glass-strong panel-card" hidden>
+          <div class="panel-head">
+            <h2 class="section-title" data-i18n="shots.listTitle">镜头列表</h2>
+            <button type="button" id="exportButton" class="btn btn-ghost !min-h-8 text-sm" data-i18n="shots.export" disabled>
+              导出 JSON
+            </button>
+          </div>
+          <div class="panel-body">
+            <canvas id="timelineCanvas" class="shots-timeline"></canvas>
+            <div id="shotCards" class="shots-cards"></div>
+          </div>
+        </section>
+      </div>
+
+      <p id="emptyHint" class="field-hint py-10 text-center" data-i18n="shots.empty">
         上传视频后开始检测转场，结果在此显示。
       </p>
-    </main>
 
-    <footer class="mx-auto max-w-4xl px-4 pb-6 text-xs text-muted">
-      <span data-i18n="shots.attr">
-        转场检测：TransNet V2（MIT，soCzech/TransNetV2；ONNX 转换 elya5/transnetv2，本页使用浏览器兼容补丁版）
-      </span>
-      ·
-      <a class="text-accent hover:underline" href="/models/TRANSNETV2-SOURCE.md" target="_blank" rel="noreferrer">Source &amp; License</a>
-    </footer>
+      <footer class="field-hint pb-4 text-center text-xs">
+        <span data-i18n="shots.attr">
+          转场检测：TransNet V2（MIT，soCzech/TransNetV2；ONNX 转换 elya5/transnetv2，本页使用浏览器兼容补丁版）
+        </span>
+        ·
+        <a class="text-[#7c6cf0] hover:underline" href="/models/TRANSNETV2-SOURCE.md" target="_blank" rel="noreferrer">Source &amp; License</a>
+      </footer>
+    </div>
 
     <canvas id="thumbCanvas" width="160" height="90" hidden></canvas>
 

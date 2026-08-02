@@ -216,3 +216,27 @@
 @media (width<=900px){.app-workspace{grid-template-rows:minmax(0,1fr) minmax(0,auto);grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.settings-panel{grid-column:1/-1;max-height:min(36vh,300px)}}
 @media (height<=700px){.app-shell{gap:.35rem;padding:.4rem .6rem}.trimbar{height:40px}}
 @media (height<=620px){.app-footer .glass{padding-top:.45rem;padding-bottom:.45rem}.progress-track{height:.45rem}.trim-info{min-height:1.1rem;margin-top:.25rem}.panel-card{--panel-aux-height:calc(48px + .25rem + 1.1rem)}}
+
+/* ---------------------------------------------------------------------------
+ * 镜头分析页（/shots.html）作用域样式：主页为 100dvh 禁滚应用壳，
+ * 镜头页为可滚动文档页；布局对齐主页玻璃拟态体系（glass/btn/chip/media-panel）。
+ * -------------------------------------------------------------------------*/
+@layer components {
+  body.shots-page{height:auto;min-height:100%;overflow-y:auto;overflow-x:hidden}
+  .shots-shell{min-height:100dvh;display:flex;flex-direction:column;gap:clamp(.5rem,1.2vh,.9rem);width:100%;max-width:1280px;margin:0 auto;padding:clamp(.5rem,1.2vh,1rem) clamp(.65rem,1.5vw,1.35rem)}
+  .shots-grid{display:grid;grid-template-columns:1fr;gap:inherit;align-items:start}
+  @media (width>=1024px){.shots-grid{grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr)}}
+  .shots-media{min-height:180px;height:min(46vh,440px)}
+  @media (width<640px){.shots-media{height:min(38vh,300px)}}
+  .shots-timeline{width:100%;border-radius:.75rem;background:#7c6cf00d;border:1px solid #7c6cf01a}
+  .shots-cards{display:flex;flex-direction:column;gap:.5rem;max-height:52vh;overflow-y:auto;scrollbar-width:thin;scrollbar-color:#7c6cf047 transparent;margin-top:.6rem;padding-right:.15rem}
+  .shots-cards::-webkit-scrollbar{width:6px}
+  .shots-cards::-webkit-scrollbar-thumb{background:#7c6cf038;border-radius:9999px}
+  .shot-card{background:#ffffff73;border:1px solid #ffffffb3;border-radius:1rem;padding:.55rem .65rem;cursor:pointer;text-align:left;transition:border-color .2s,box-shadow .2s;display:flex;align-items:center;gap:.6rem;box-shadow:0 2px 10px #7864b40d}
+  .shot-card:hover:not(:disabled){border-color:#7c6cf047}
+  .shot-card.is-active{border-color:#7c6cf080;box-shadow:0 0 0 3px #7c6cf01f}
+  .shot-card .shot-thumb{border-radius:.6rem;background:#14121c;flex-shrink:0}
+  .shot-card.is-active{outline:none}
+}
+  .shots-page .panel-card>.panel-head{padding:clamp(.6rem,1.5vh,.9rem) clamp(.75rem,1.5vw,1rem) 0}
+  .shots-page .panel-body{padding:clamp(.6rem,1.5vh,.9rem) clamp(.75rem,1.5vw,1rem) clamp(.75rem,1.8vh,1rem)}
