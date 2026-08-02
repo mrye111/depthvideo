@@ -149,8 +149,12 @@ def _generate_inputs(frames, question: str):
     messages = _messages(_to_pil(frames), question)
     text = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     images, videos, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+    # transformers v5：processor 的 fps 只收标量；process_vision_info 返回每视频一个元素的列表
+    kwargs = dict(video_kwargs)
+    if isinstance(kwargs.get('fps'), (list, tuple)) and len(kwargs['fps']) == 1:
+        kwargs['fps'] = kwargs['fps'][0]
     inputs = _processor(
-        text=[text], images=images, videos=videos, padding=True, return_tensors='pt', **video_kwargs
+        text=[text], images=images, videos=videos, padding=True, return_tensors='pt', **kwargs
     )
     return inputs.to(_model.device)
 
