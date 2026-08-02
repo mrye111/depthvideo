@@ -50,11 +50,52 @@ function licenseBannerPlugin(): Plugin {
   };
 }
 
+/** 镜头分析页的 ORT 直引配套：把 onnxruntime-web 运行时文件复制到 dist 同路径
+ *  （transnet.ts 以 '/node_modules/onnxruntime-web/dist/...' 绝对路径引入并 external，
+ *   运行时浏览器按同 URL 取文件；dev 下 node_modules 本就可静态服务） */
+const ORT_RUNTIME_FILES = [
+  'ort.all.mjs',
+  'ort-wasm-simd-threaded.mjs',
+  'ort-wasm-simd-threaded.wasm',
+  'ort-wasm-simd-threaded.jsep.mjs',
+  'ort-wasm-simd-threaded.jsep.wasm',
+  'ort-wasm-simd-threaded.jspi.mjs',
+  'ort-wasm-simd-threaded.jspi.wasm',
+  'ort-wasm-simd-threaded.asyncify.mjs',
+  'ort-wasm-simd-threaded.asyncify.wasm',
+];
+
+function copyOrtPlugin(): Plugin {
+  return {
+    name: 'copy-ort-runtime',
+    apply: 'build',
+    writeBundle(options) {
+      const srcDir = path.join(__dirname, 'node_modules', 'onnxruntime-web', 'dist');
+      const dstDir = path.join(
+        options.dir ?? path.join(__dirname, 'dist'),
+        'node_modules',
+        'onnxruntime-web',
+        'dist',
+      );
+      fs.mkdirSync(dstDir, { recursive: true });
+      for (const f of ORT_RUNTIME_FILES) {
+        fs.copyFileSync(path.join(srcDir, f), path.join(dstDir, f));
+      }
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [tailwindcss(), licenseBannerPlugin()],
+  plugins: [tailwindcss(), licenseBannerPlugin(), copyOrtPlugin()],
   build: {
-    // 源文件中确实存在的 legal 注释（如 onnxruntime-web 的 /*! ... */）同样保留
+    // 多页应用：深度工具主页 + 镜头分析页（互不引用，独立入口）
     rollupOptions: {
+      input: {
+        main: path.join(__dirname, 'index.html'),
+        shots: path.join(__dirname, 'shots.html'),
+      },
+      // 镜头分析页的 ORT 运行时按绝对路径外置（由 copyOrtPlugin 复制到 dist 同路径）
+      external: [/^\/node_modules\//],
       output: {
         legalComments: 'inline',
       },

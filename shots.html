@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/logo.png" />
+    <link rel="apple-touch-icon" href="/logo.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>镜头分析 · depthvideo</title>
+    <meta
+      name="description"
+      content="镜头分析：在浏览器本地检测视频转场、切分镜头（TransNet V2），可配合本地运镜分析服务标注运镜。无需上传、无需 API。"
+    />
+    <meta name="robots" content="noindex" />
+    <meta name="theme-color" content="#5c4fd6" />
+    <script type="module" src="/src/shots/main.ts"></script>
+  </head>
+  <body>
+    <header class="mx-auto flex max-w-4xl items-center justify-between gap-3 px-4 py-3">
+      <div class="flex items-center gap-2">
+        <img src="/logo.png" alt="" class="h-7 w-7" />
+        <h1 class="text-lg font-semibold" data-i18n="shots.title">镜头分析</h1>
+        <span id="epBadge" class="chip" hidden></span>
+      </div>
+      <div class="flex items-center gap-3">
+        <a href="/" class="text-sm text-accent hover:underline" data-i18n="shots.back">← 返回深度工具</a>
+        <div class="lang-switch" role="group" aria-label="语言">
+          <button type="button" class="lang-btn" data-lang="zh" aria-pressed="false">中文</button>
+          <button type="button" class="lang-btn" data-lang="en" aria-pressed="false">EN</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="mx-auto max-w-4xl space-y-4 px-4 pb-8">
+      <!-- 上传区 -->
+      <section id="dropZone" class="rounded-xl border-2 border-dashed border-line bg-surface p-6 text-center">
+        <input type="file" id="fileInput" accept="video/*,.mp4,.webm,.mov,.mkv,.m4v" hidden />
+        <p class="text-sm text-muted">
+          <span data-i18n="shots.dropHint">拖放视频到这里，或</span>
+          <button type="button" id="pickButton" class="control ml-1" data-i18n="shots.pick">选择视频</button>
+        </p>
+        <p id="fileName" class="mt-2 font-mono text-xs text-muted" hidden></p>
+      </section>
+
+      <!-- 预览 + 元信息 + 控制 -->
+      <section id="previewCard" class="rounded-xl border border-line bg-surface p-4" hidden>
+        <video id="preview" class="w-full rounded-lg bg-black" controls muted playsinline></video>
+        <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-muted">
+          <span><span data-i18n="shots.metaRes">分辨率</span>：<span id="metaRes">–</span></span>
+          <span><span data-i18n="shots.metaDur">时长</span>：<span id="metaDur">–</span></span>
+          <span><span data-i18n="shots.metaFps">帧率</span>：<span id="metaFps">–</span></span>
+        </div>
+        <p id="longVideoHint" class="mt-1 text-xs text-warn" hidden></p>
+        <div class="mt-3 flex items-center gap-3">
+          <button type="button" id="startButton" class="control" data-i18n="shots.start">开始检测</button>
+          <button type="button" id="cancelButton" class="control" data-i18n="shots.cancel" disabled>取消</button>
+          <div class="flex-1">
+            <div class="h-1.5 w-full overflow-hidden rounded bg-line">
+              <div id="progressBar" class="h-full w-0 bg-accent transition-[width]"></div>
+            </div>
+          </div>
+        </div>
+        <p id="statusLine" class="mt-2 text-sm text-muted"></p>
+      </section>
+
+      <!-- 镜头列表 -->
+      <section id="resultCard" class="rounded-xl border border-line bg-surface p-4" hidden>
+        <h2 class="mb-2 text-base font-semibold" data-i18n="shots.listTitle">镜头列表</h2>
+        <table class="w-full text-sm">
+          <thead class="text-left text-xs text-muted">
+            <tr>
+              <th class="py-1 pr-3" data-i18n="shots.colIndex">#</th>
+              <th class="py-1 pr-3" data-i18n="shots.colRange">起止</th>
+              <th class="py-1 pr-3" data-i18n="shots.colDur">时长</th>
+              <th class="py-1" data-i18n="shots.colFrames">帧区间</th>
+            </tr>
+          </thead>
+          <tbody id="shotRows"></tbody>
+        </table>
+      </section>
+
+      <p id="emptyHint" class="py-10 text-center text-sm text-muted" data-i18n="shots.empty">
+        上传视频后开始检测转场，结果在此显示。
+      </p>
+    </main>
+
+    <footer class="mx-auto max-w-4xl px-4 pb-6 text-xs text-muted">
+      <span data-i18n="shots.attr">
+        转场检测：TransNet V2（MIT，soCzech/TransNetV2；ONNX 转换 elya5/transnetv2，本页使用浏览器兼容补丁版）
+      </span>
+      ·
+      <a class="text-accent hover:underline" href="/models/TRANSNETV2-SOURCE.md" target="_blank" rel="noreferrer">Source &amp; License</a>
+    </footer>
+
+    <noscript>
+      <main>
+        <h1>镜头分析</h1>
+        <p>本页面在浏览器本地检测视频转场并切分镜头（TransNet V2），需要启用 JavaScript。</p>
+      </main>
+    </noscript>
+  </body>
+</html>
