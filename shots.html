@@ -43,7 +43,7 @@
 
       <!-- 预览 + 元信息 + 控制 -->
       <section id="previewCard" class="rounded-xl border border-line bg-surface p-4" hidden>
-        <video id="preview" class="w-full rounded-lg bg-black" controls muted playsinline></video>
+        <video id="preview" class="mx-auto w-full max-w-full rounded-lg bg-black object-contain" style="max-height: 52vh" controls muted playsinline></video>
         <div class="mt-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-sm text-muted">
           <span><span data-i18n="shots.metaRes">分辨率</span>：<span id="metaRes">–</span></span>
           <span><span data-i18n="shots.metaDur">时长</span>：<span id="metaDur">–</span></span>
