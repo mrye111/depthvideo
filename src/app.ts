@@ -380,6 +380,24 @@ const processCanvas = document.createElement('canvas');
 const processCtx = processCanvas.getContext('2d', { willReadFrequently: true })!;
 let depthCtx: CanvasRenderingContext2D;
 
+// 源帧去重状态（随 startProcessing 重置）
+let lastFrameOutput: DepthEstimationOutput | null = null;
+let lastFrameMask: PersonMask | null = null;
+let lastFrameHash = '';
+
+/** 帧内容指纹：跨步抽样式双 FNV-1a。同一源帧重解码/重绘后指纹不变，
+ *  不同源帧几乎必然不同（抽样覆盖全图，微小变动对深度图影响也可忽略）。 */
+function hashProcessFrame(): string {
+  const img = processCtx.getImageData(0, 0, processCanvas.width, processCanvas.height).data;
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < img.length; i += 257) {
+    h1 = Math.imul(h1 ^ img[i], 0x01000193);
+    h2 = Math.imul(h2 ^ img[i], 0x85ebca6b);
+  }
+  return `${h1 >>> 0}:${h2 >>> 0}:${img.length}`;
+}
+
 // ---------------------------------------------------------------------------
 // 工具
 // ---------------------------------------------------------------------------
@@ -399,8 +417,21 @@ function withTimeout<T>(p: Promise<T>, ms: number, onTimeout: () => Error): Prom
   });
 }
 
+// 让出主线程一个宏任务：用 MessageChannel 而非 rAF。
+// rAF 每帧要等下一次重绘（60Hz 下最多 ~16.7ms），处理循环每帧调用会白白拖慢；
+// MessageChannel 宏任务几乎零延迟，UI/事件回调仍有机会在宏任务间隙执行。
+let pendingYieldResolve: (() => void) | null = null;
+const yieldChannel = new MessageChannel();
+yieldChannel.port1.onmessage = () => {
+  const r = pendingYieldResolve;
+  pendingYieldResolve = null;
+  r?.();
+};
 function nextFrame(): Promise<void> {
-  return new Promise((r) => requestAnimationFrame(() => r()));
+  return new Promise((r) => {
+    pendingYieldResolve = r;
+    yieldChannel.port2.postMessage(null);
+  });
 }
 
 function isCancelError(e: unknown): boolean {
@@ -637,6 +668,22 @@ function seekVideo(target: number): Promise<void> {
 // ---------------------------------------------------------------------------
 // 模型加载（变体回退 + 下载进度 + 超时）
 // ---------------------------------------------------------------------------
+/** 读取本地提速开关：?infer= 查询参数优先，其次 localStorage 'dv.inferLongSide'。
+ *  返回对齐到 14 倍数的推理输入长边（98–504），未设置或越界返回 null（=保持默认 518）。 */
+function readInferLongSideOverride(): number | null {
+  try {
+    const fromQuery = new URLSearchParams(location.search).get('infer');
+    const raw = fromQuery ?? localStorage.getItem('dv.inferLongSide');
+    if (!raw) return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    const clamped = Math.round(n / 14) * 14;
+    return clamped >= 98 && clamped < 518 ? clamped : null;
+  } catch {
+    return null;
+  }
+}
+
 async function loadDepthModel(): Promise<DepthEstimationPipeline> {
   const spec = currentModelSpec();
   const device = deviceSelect.value;
@@ -701,6 +748,17 @@ async function loadDepthModel(): Promise<DepthEstimationPipeline> {
       );
       depthPipe = pipe;
       depthPipeKey = key;
+      // 本地提速开关（非原站默认行为）：?infer=392 或 localStorage 'dv.inferLongSide'。
+      // 将推理输入长边从默认 518 缩小，速度大幅提升、深度细节略降；不设则保持原样。
+      const inferLongSide = readInferLongSideOverride();
+      if (inferLongSide) {
+        const ip = (pipe as unknown as { processor?: { image_processor?: { size?: unknown } } })
+          .processor?.image_processor;
+        if (ip?.size) {
+          ip.size = { width: inferLongSide, height: inferLongSide };
+          console.warn(`[dv] 推理输入长边已降为 ${inferLongSide}（本地提速，默认 518）`);
+        }
+      }
       setTitle({ key: 'title.init' });
       void refreshModelCacheUI();
       return pipe;
@@ -957,24 +1015,51 @@ function jet(x: number): [number, number, number] {
   return [c(3), c(2), c(1)];
 }
 
+/** Jet 查找表：256 级颜色预计算，避免逐像素函数调用与临时数组分配 */
+const JET_LUT = (() => {
+  const lut = new Uint8ClampedArray(256 * 3);
+  for (let v = 0; v < 256; v++) {
+    const [r, g, b] = jet(v / 255);
+    lut[v * 3] = r;
+    lut[v * 3 + 1] = g;
+    lut[v * 3 + 2] = b;
+  }
+  return lut;
+})();
+
+/** renderDepth 复用的 ImageData 缓冲（每帧写满，避免逐帧分配） */
+let depthImg: ImageData | null = null;
+
 /** 重置时域平滑状态（重新开始导出 / 换方向 / 换平滑系数 / 深度尺寸变化时调用） */
 function resetSmoothState(): void {
   prevSmooth = null;
 }
 
 function renderDepth(depth: RawImage, mask: PersonMask | null = null): void {
-  const src = depth.toCanvas() as HTMLCanvasElement;
-  const sw = src.width;
-  const sh = src.height;
+  const sw = depth.width;
+  const sh = depth.height;
+  const pixels = sw * sh;
   if (mapCanvas.width !== sw || mapCanvas.height !== sh) {
     mapCanvas.width = sw;
     mapCanvas.height = sh;
+    depthImg = null;
     prevSmooth = null;
   }
-  mapCtx.drawImage(src, 0, 0);
-  const img = mapCtx.getImageData(0, 0, sw, sh);
-  const d = img.data;
-  const pixels = d.length / 4;
+  if (!depthImg) depthImg = mapCtx.createImageData(sw, sh);
+  const d = depthImg.data;
+
+  // 灰度源：深度输出为单通道 Uint8ClampedArray 时直接读取（1 通道下 CHW 与 HW 等价），
+  // 跳过 toCanvas + getImageData 的逐帧画布往返；异常布局回退原 canvas 路径
+  let raw: Uint8ClampedArray;
+  if (depth.channels === 1 && depth.data instanceof Uint8ClampedArray) {
+    raw = depth.data;
+  } else {
+    const src = depth.toCanvas() as HTMLCanvasElement;
+    mapCtx.drawImage(src, 0, 0);
+    const img = mapCtx.getImageData(0, 0, sw, sh);
+    raw = new Uint8ClampedArray(pixels);
+    for (let p = 0, i = 0; p < pixels; p++, i += 4) raw[p] = img.data[i];
+  }
 
   // 逐帧实时读取样式设置，处理中改动下一帧即生效
   const invert = directionSelect.value === 'far-white';
@@ -985,16 +1070,16 @@ function renderDepth(depth: RawImage, mask: PersonMask | null = null): void {
   if (!primed) prevSmooth = new Uint8ClampedArray(pixels);
   const prev = prevSmooth as Uint8ClampedArray;
 
-  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
-    let v = invert ? 255 - d[i] : d[i];
+  for (let p = 0, i = 0; p < pixels; p++, i += 4) {
+    let v = invert ? 255 - raw[p] : raw[p];
     // 一阶 IIR：out = prev*k + cur*(1-k)，与上一帧输出做指数平均；首帧无平滑
     if (primed && k > 0) v = Math.round(prev[p] * k + v * (1 - k));
     prev[p] = v;
     if (turbo) {
-      const [r, g, b] = jet(v / 255);
-      d[i] = r;
-      d[i + 1] = g;
-      d[i + 2] = b;
+      const j = v * 3;
+      d[i] = JET_LUT[j];
+      d[i + 1] = JET_LUT[j + 1];
+      d[i + 2] = JET_LUT[j + 2];
     } else {
       d[i] = v;
       d[i + 1] = v;
@@ -1002,7 +1087,7 @@ function renderDepth(depth: RawImage, mask: PersonMask | null = null): void {
     }
     d[i + 3] = 255;
   }
-  mapCtx.putImageData(img, 0, 0);
+  mapCtx.putImageData(depthImg, 0, 0);
   depthCtx.drawImage(mapCanvas, 0, 0, depthCanvas.width, depthCanvas.height);
   if (mask) compositePersonMask(mask);
 }
@@ -1459,6 +1544,9 @@ async function startProcessing(): Promise<void> {
   processing = true;
   cancelled = false;
   resetSmoothState();
+  lastFrameOutput = null;
+  lastFrameMask = null;
+  lastFrameHash = '';
   stopSyncPlay();
   trimBar.classList.add('is-disabled');
   startButton.disabled = true;
@@ -1522,14 +1610,41 @@ async function startProcessing(): Promise<void> {
     }
 
     const t0 = performance.now();
+    // 帧时间戳（与裁剪区间、fps 对齐），预取下一帧时用同一函数
+    const timeAt = (idx: number) => Math.min(start + idx / fps, Math.max(start, end - 0.001));
+    // 首帧 seek 先入流水；之后每帧画完立即预取下一帧，
+    // 让视频解码与本次 GPU 推理并行，隐藏 seek 延迟
+    let pendingSeek: Promise<void> | null = seekVideo(timeAt(0));
+    pendingSeek.catch(() => {
+      /* 取消路径下该 Promise 可能无人 await，避免未处理拒绝 */
+    });
     for (let i = 0; i < total; i++) {
       if (cancelled) throw new Error(t('status.aborted'));
-      const tSec = Math.min(start + i / fps, Math.max(start, end - 0.001));
-      await seekVideo(tSec);
+      await pendingSeek;
+      pendingSeek = null;
       processCtx.drawImage(sourceVideo, 0, 0, w, h);
-      const output = (await pipe(RawImage.fromCanvas(processCanvas))) as DepthEstimationOutput;
-      // 分割与深度推理在同一帧循环内串行完成（先深度后分割），失败回退全白掩码
-      const mask = personMode ? await getPersonMask(Math.round(tSec * 1000)) : null;
+      if (i + 1 < total) {
+        pendingSeek = seekVideo(timeAt(i + 1));
+        pendingSeek.catch(() => {
+          /* 同上 */
+        });
+      }
+      // 源帧去重：导出 fps 高于源视频 fps 时，相邻输出帧会映射到同一源帧。
+      // 模型对同一输入的输出是确定的，直接复用上一帧的深度/掩码，跳过本次推理。
+      const frameHash = hashProcessFrame();
+      let output: DepthEstimationOutput;
+      let mask: PersonMask | null = null;
+      if (lastFrameOutput && frameHash === lastFrameHash) {
+        output = lastFrameOutput;
+        mask = lastFrameMask;
+      } else {
+        output = (await pipe(RawImage.fromCanvas(processCanvas))) as DepthEstimationOutput;
+        // 分割与深度推理在同一帧循环内串行完成（先深度后分割），失败回退全白掩码
+        mask = personMode ? await getPersonMask(Math.round(timeAt(i) * 1000)) : null;
+        lastFrameOutput = output;
+        lastFrameMask = mask;
+        lastFrameHash = frameHash;
+      }
       renderDepth(output.depth, mask);
       await session.encodeFrame(i);
 
